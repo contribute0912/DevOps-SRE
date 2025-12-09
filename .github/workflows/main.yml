@@ -79,11 +79,18 @@ jobs:
           fi
 
       # PR-only: post comment
+
       - name: Comment on PR with AI review
         if: ${{ github.event_name == 'pull_request' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Save the AI completion to a file to avoid quoting issues
+          BODY_FILE="$RUNNER_TEMP/ai_review.md"
+          printf "%s\n" "${{ steps.ai.outputs.completion }}" > "$BODY_FILE"
+
+          # Post the comment using --body-file (robust for multiline/quotes)
           gh pr comment ${{ github.event.pull_request.number }} \
             --repo "${{ github.repository }}" \
-            --body "${{ steps.ai.outputs.completion }}"
+            --body-file "$BODY_FILE"
+
