@@ -1,0 +1,55 @@
+
+name: AI PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  models: read  # Required to call GitHub Models from Actions
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Use GitHub CLI to capture the diff of this PR
+      - name: Get PR diff
+        id: diff
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "changeset<<EOF" >> $GITHUB_OUTPUT
+          gh pr diff ${{ github.event.pull_request.number }} --repo "${{ github.repository }}" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      # Call GitHub Models via an AI inference action (model can be changed)
+      - name: AI code review
+        id: ai
+        uses: github/samples-ai/ai-inference-action@v1
+        with:
+          model: openai/gpt-4.1-mini
+          prompt: |
+            You are a strict, helpful code reviewer.
+            Review the following diff and provide:
+            - 3–7 targeted comments (security, performance, readability)
+            - mention SAST-relevant concerns if any
+            - propose small actionable fixes with examples
+            Reply in Markdown.
+            Diff:
+            ${{ steps.diff.outputs.changeset }}
+
+      # Post the AI feedback back to the PR
+      - name: Comment on PR with AI review
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --repo "${{ github.repository }}" \
+            --body "${{ steps.ai.outputs.completion }}"
