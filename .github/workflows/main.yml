@@ -4,6 +4,8 @@ name: AI PR Review (GitHub Models)
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+    branches: [ "main" ]
+  workflow_dispatch:  # allows manual run from Actions tab (for sanity check)
 
 permissions:
   contents: read
@@ -24,6 +26,7 @@ jobs:
 
       # Write the PR diff to a temp file (avoid outputs for large/messy content)
       - name: Get PR diff to file
+        if: ${{ github.event_name == 'pull_request' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -32,16 +35,15 @@ jobs:
             > "$RUNNER_TEMP/pr.diff"
 
       - name: AI code review via GitHub Models (curl)
+        if: ${{ github.event_name == 'pull_request' }}
         id: ai
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Read diff safely (may contain quotes, ${{
-          # ... }}, YAML, etc.)
+          # Read diff safely (may contain quotes, ${{ }}, YAML, etc.)
           USER_TEXT=$(printf "Review the following Git diffs:\n%s" "$(cat "$RUNNER_TEMP/pr.diff")")
 
           # Build JSON payload for GitHub Models chat completions
-          # Docs: https://docs.github.com/en/github-models/quickstart
           PAYLOAD=$(jq -n \
             --arg model "openai/gpt-4.1-mini" \
             --arg sys "You are a strict, helpful code reviewer. Provide a concise, actionable review focusing on security, performance, readability, and small fixes." \
@@ -83,6 +85,7 @@ jobs:
           fi
 
       - name: Comment on PR with AI review
+        if: ${{ github.event_name == 'pull_request' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
