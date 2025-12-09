@@ -22,31 +22,35 @@ jobs:
       - name: Install jq (JSON parser)
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Get PR diff
-        id: diff
+      # Write the PR diff to a temp file (avoid outputs for large/messy content)
+      - name: Get PR diff to file
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "changeset<<EOF" >> $GITHUB_OUTPUT
-          gh pr diff ${{ github.event.pull_request.number }} --repo "${{ github.repository }}" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          gh pr diff ${{ github.event.pull_request.number }} \
+            --repo "${{ github.repository }}" \
+            > "$RUNNER_TEMP/pr.diff"
 
       - name: AI code review via GitHub Models (curl)
         id: ai
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Read diff safely (may contain quotes, ${{
+          # ... }}, YAML, etc.)
+          USER_TEXT=$(printf "Review the following Git diffs:\n%s" "$(cat "$RUNNER_TEMP/pr.diff")")
+
           # Build JSON payload for GitHub Models chat completions
           # Docs: https://docs.github.com/en/github-models/quickstart
           PAYLOAD=$(jq -n \
             --arg model "openai/gpt-4.1-mini" \
             --arg sys "You are a strict, helpful code reviewer. Provide a concise, actionable review focusing on security, performance, readability, and small fixes." \
-            --arg user "Review the following Git diffs:\n${{ steps.diff.outputs.changeset }}" \
+            --arg user "$USER_TEXT" \
             '{
               model: $model,
               messages: [
-                {role: "system", content: $sys},
-                {role: "user", content: $user}
+                { "role": "system", "content": $sys },
+                { "role": "user",   "content": $user }
               ]
             }')
 
@@ -60,21 +64,22 @@ jobs:
             https://models.github.ai/inference/chat/completions \
             -d "${PAYLOAD}")
 
-          # Basic error guard: ensure choices[0].message.content exists
-          COMPLETION=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty')
+          # Extract assistant message; remain robust if schema changes
+          COMPLETION=$(echo "$RESPONSE" | jq -r '
+            .choices[0].message.content
+            // .choices[0].delta.content
+            // empty
+          ')
 
+          # Expose completion to next step; use a unique delimiter to avoid collisions
           if [ -z "$COMPLETION" ]; then
-            echo "No AI completion returned. Full response:"
-            echo "$RESPONSE"
-            # Fail gracefully but still surface the response for debugging.
-            echo "completion<<EOF" >> $GITHUB_OUTPUT
-            echo ":warning: AI review failed to produce output. See workflow logs for details.\n\n\`\`\`json\n$RESPONSE\n\`\`\`" >> $GITHUB_OUTPUT
-            echo "EOF" >> $GITHUB_OUTPUT
+            echo "completion<<AI_EOF" >> "$GITHUB_OUTPUT"
+            printf ":warning: AI review returned no content.\n\nResponse:\n\`\`\`json\n%s\n\`\`\`\n" "$RESPONSE" >> "$GITHUB_OUTPUT"
+            echo "AI_EOF" >> "$GITHUB_OUTPUT"
           else
-            # Expose the AI text to later steps
-            echo "completion<<EOF" >> $GITHUB_OUTPUT
-            echo "$COMPLETION" >> $GITHUB_OUTPUT
-            echo "EOF" >> $GITHUB_OUTPUT
+            echo "completion<<AI_EOF" >> "$GITHUB_OUTPUT"
+            printf "%s\n" "$COMPLETION" >> "$GITHUB_OUTPUT"
+            echo "AI_EOF" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Comment on PR with AI review
