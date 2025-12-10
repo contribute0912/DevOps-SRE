@@ -83,8 +83,8 @@ env:
 
   NEEDS_INFO_LABEL: "needs-more-info"
   DUPLICATE_LABEL: "duplicate"
-  # When true, the workflow will close issues the model flags as a confident duplicate.
-  ALLOW_AUTO_CLOSE_DUPLICATES: "false" # simplified: duplicates disabled in this version
+  # Keeping duplicates auto-close off for simplicity in this version
+  ALLOW_AUTO_CLOSE_DUPLICATES: "false"
 
 jobs:
   triage:
@@ -122,10 +122,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh api \
-            --repo "${{ github.repository }}" \
-            repos/${{ github.repository }}/issues/${{ steps.ctx.outputs.issue }} \
+            -H "Accept: application/vnd.github+json" \
+            /repos/${{ github.repository }}/issues/${{ steps.ctx.outputs.issue }} \
             --jq '.' > "$RUNNER_TEMP/issue.json"
-          jq '{number, title, user: .user.login, body, state, labels: [.labels[].name], created_at, updated_at}' "$RUNNER_TEMP/issue.json" > "$RUNNER_TEMP/issue_min.json"
+
+          jq '{number, title, user: .user.login, body, state, labels: [.labels[].name], created_at, updated_at}' \
+            "$RUNNER_TEMP/issue.json" > "$RUNNER_TEMP/issue_min.json"
+
           echo "Fetched issue:"
           cat "$RUNNER_TEMP/issue_min.json"
 
@@ -170,9 +173,6 @@ jobs:
           FEWSHOT_2='{"category":"performance","severity":"medium","priority":"P2","team":"backend","labels":["performance","area:backend","api"],"needs_info":true,"missing_info":["logs","environment","version"],"rationale":"API latency regression; missing diagnostics"}'
           printf "%s" "$SYS_PROMPT" > "$RUNNER_TEMP/sys_prompt.txt"
           printf "%s" "$USER_TEXT" > "$RUNNER_TEMP/user_prompt.json"
-          echo "system<<SYS_EOF" >> "$GITHUB_OUTPUT"
-          cat "$RUNNER_TEMP/sys_prompt.txt" >> "$GITHUB_OUTPUT"
-          echo "SYS_EOF" >> "$GITHUB_OUTPUT"
 
       - name: Call GitHub Models for triage (curl)
         id: ai
@@ -228,9 +228,6 @@ jobs:
             echo "::warning::AI output was not valid JSON. Falling back to minimal triage."
             echo '{"category":"other","severity":null,"priority":null,"team":null,"labels":[],"needs_info":false,"missing_info":[],"rationale":"fallback"}' > "$RUNNER_TEMP/triage.json"
           fi
-          echo "triage<<JSON_EOF" >> "$GITHUB_OUTPUT"
-          cat "$RUNNER_TEMP/triage.json" >> "$GITHUB_OUTPUT"
-          echo "JSON_EOF" >> "$GITHUB_OUTPUT"
 
       # === Heuristic fallback if AI returns null severity & priority ===
       - name: Heuristic fallback (if severity/priority are null)
@@ -248,7 +245,7 @@ jobs:
               SEV="high"; PRI="P1"; [ "$CAT" = "other" ] && CAT="security"
             elif echo "$LOWER" | grep -Eq 'perf|performance|slow|latency|timeout|hang|sluggish'; then
               SEV="medium"; PRI="P2"; [ "$CAT" = "other" ] && CAT="performance"
-            elif echo "$LOWER" | grep -Eq 'crash|error|exception|traceback|500|stack|fail|broken'; then
+            elif echo "$LOWER" | grep -Eq 'crash|error|exception|traceback|500|stack|fail|broken|403 forbidden|401 unauthorized'; then
               SEV="high"; PRI="P1"; [ "$CAT" = "other" ] && CAT="bug"
             else
               SEV="low"; PRI="P3"
@@ -383,7 +380,6 @@ jobs:
       - name: Post triage summary comment
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PRIORITY_LABELS_JSON: ${{ env.PRIORITY_LABELS_JSON }}
         run: |
           CAT=$(jq -r '.category' "$RUNNER_TEMP/triage.json")
           SEV=$(jq -r '.severity // "n/a"' "$RUNNER_TEMP/triage.json")
@@ -413,6 +409,7 @@ jobs:
             echo ""
             echo "_This is an automated triage using GitHub Models (${MODEL_ID})._"
           } > "$RUNNER_TEMP/triage_comment.md"
+
           gh issue comment ${{ steps.ctx.outputs.issue }} --body-file "$RUNNER_TEMP/triage_comment.md" --repo "${{ github.repository }}"
 
       - name: Re-triage trigger on comment (optional cleanup)
