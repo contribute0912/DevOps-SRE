@@ -1,0 +1,187 @@
+
+name: AI PR Security Review (GitHub Models)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [ "main" ]          # adjust/remove to fit your target branches
+  workflow_dispatch:               # manual trigger (optional)
+
+permissions:
+  contents: read
+  pull-requests: write             # needed to post a PR comment
+  models: read                     # needed to call GitHub Models
+  # issues: write                  # uncomment only if you plan to add labels to the PR
+
+env:
+  MODEL_ID: "openai/gpt-4.1-mini"
+  MAX_DIFF_BYTES: "80000"          # cap diff size sent to the model
+  MAX_FILES_BYTES: "80000"         # cap total sample bytes from changed files
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Sanity step (runs on all events)
+        run: |
+          echo "Event: ${{ github.event_name }}"
+          echo "Repo:  ${{ github.repository }}"
+          echo "PR #:  ${{ github.event.pull_request.number || 'n/a' }}"
+          echo "Ref:   ${{ github.ref }}"
+          echo "SHA:   ${{ github.sha }}"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ensure jq and gh CLI
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+          gh --version || (type -p curl >/dev/null || sudo apt-get install -y curl && \
+            curl -fsSL https://raw.githubusercontent.com/cli/cli/trunk/script/install.sh | sudo bash)
+
+      # Collect compact diff and sample snippets of changed files (base..head)
+      - name: Collect PR diff & changed files
+        if: ${{ github.event_name == 'pull_request' }}
+        run: |
+          set -euo pipefail
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+          # Unified (compact) diff to keep payload small
+          git diff --unified=0 "$BASE_SHA" "$HEAD_SHA" > "$RUNNER_TEMP/pr.diff" || true
+          DIFF_SIZE=$(wc -c < "$RUNNER_TEMP/pr.diff" || echo 0)
+          if [ "$DIFF_SIZE" -gt "${MAX_DIFF_BYTES}" ]; then
+            echo "::warning::PR diff is $DIFF_SIZE bytes; truncating to ${MAX_DIFF_BYTES}."
+            head -c "${MAX_DIFF_BYTES}" "$RUNNER_TEMP/pr.diff" > "$RUNNER_TEMP/pr.diff.trunc"
+            mv "$RUNNER_TEMP/pr.diff.trunc" "$RUNNER_TEMP/pr.diff"
+          fi
+
+          # List changed files
+          CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" | tr '\n' ' ')
+          echo "Changed files: $CHANGED"
+
+          # Build a small sample from changed source files
+          : > "$RUNNER_TEMP/files_sample.txt"
+          total=0
+          for f in $CHANGED; do
+            case "$f" in
+              *.py|*.js|*.ts|*.tsx|*.jsx|*.go|*.java|*.kt|*.rb|*.php|*.cs|*.c|*.cpp)
+                if [ -f "$f" ]; then
+                  echo -e "\n===== FILE: $f =====\n" >> "$RUNNER_TEMP/files_sample.txt"
+                  append=$(( 16 * 1024 ))      # ~16KB per file
+                  rem=$(( ${MAX_FILES_BYTES} - total ))
+                  [ "$rem" -lt "$append" ] && append="$rem"
+                  [ "$append" -le 0 ] && break
+                  head -c "$append" "$f" >> "$RUNNER_TEMP/files_sample.txt"
+                  total=$(( total + append ))
+                fi
+              ;;
+            esac
+          done
+
+      # Build a security-focused SYSTEM prompt and a JSON USER payload
+      - name: Build AI prompts (security review)
+        if: ${{ github.event_name == 'pull_request' }}
+        run: |
+          set -euo pipefail
+
+          # SYSTEM prompt (Markdown output)
+          cat > "$RUNNER_TEMP/system_prompt.txt" <<'SYS'
+You are a senior application security engineer. Review the provided PR diff and file snippets.
+Return STRICT Markdown (no JSON) with these sections:
+- Summary
+- High-risk findings (with direct code pointers if possible)
+- Medium/Low findings
+- Suggested fixes (actionable, concise)
+- References (OWASP/CWE, library docs)
+Focus on common vulns: injection (SQL/command), XSS, SSRF, auth/authz gaps, insecure crypto, unsafe deserialization, path traversal, secrets exposure, dangerous eval/system calls, insecure HTTP/TLS usage, open redirects, insecure cookies.
+Keep the review under ~5000 characters.
+SYS
+
+          # USER payload as JSON to preserve content safely
+          jq -n \
+            --arg repo   "${{ github.repository }}" \
+            --arg pr     "${{ github.event.pull_request.number }}" \
+            --arg title  "${{ github.event.pull_request.title }}" \
+            --arg author "${{ github.event.pull_request.user.login }}" \
+            --rawfile diff  "$RUNNER_TEMP/pr.diff" \
+            --rawfile files "$RUNNER_TEMP/files_sample.txt" \
+            '{
+              task: "Security review of PR code changes. Return STRICT Markdown with sections.",
+              repo: $repo,
+              pr_number: $pr,
+              pr_title: $title,
+              author: $author,
+              diff_unified: $diff,
+              changed_files_sample: $files,
+              rules: [
+                "Prefer concrete evidence with code pointers.",
+                "If evidence is strong, mark High risk; otherwise Medium/Low.",
+                "Keep under ~5000 characters."
+              ]
+            }' > "$RUNNER_TEMP/user_payload.json"
+
+      # Call GitHub Models with the prompts
+      - name: AI code review via GitHub Models (curl)
+        if: ${{ github.event_name == 'pull_request' }}
+        id: ai
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          SYS=$(cat "$RUNNER_TEMP/system_prompt.txt")
+          USER=$(cat "$RUNNER_TEMP/user_payload.json")
+
+          PAYLOAD=$(jq -n \
+            --arg model "${MODEL_ID}" \
+            --arg sys "$SYS" \
+            --arg user "$USER" \
+            '{
+              model: $model,
+              messages: [
+                { "role": "system", "content": $sys },
+                { "role": "user",   "content": $user }
+              ],
+              temperature: 0.2
+            }')
+
+          RESPONSE=$(curl -sSL -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/json" \
+            https://models.github.ai/inference/chat/completions \
+            -d "${PAYLOAD}")
+
+          COMPLETION=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty')
+          if [ -z "$COMPLETION" ]; then
+            echo "::warning::AI review returned no content. Posting fallback."
+            COMPLETION="# AI Security Review\n\nThe model did not return content. Please re-run or reduce diff size."
+          fi
+
+          # Write for next step and as step output
+          printf "%s\n" "$COMPLETION" > "$RUNNER_TEMP/ai_review.md"
+          echo "completion<<AI_EOF" >> "$GITHUB_OUTPUT"
+          printf "%s\n" "$COMPLETION" >> "$GITHUB_OUTPUT"
+          echo "AI_EOF" >> "$GITHUB_OUTPUT"
+
+      # Post the AI review as a PR comment
+      - name: Comment on PR with AI review
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --repo "${{ github.repository }}" \
+            --body-file "$RUNNER_TEMP/ai_review.md"
+
+      # Optional: also expose review as an artifact for manual runs
+      - name: Upload review artifact (manual runs)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-security-review
+          path: ${{ runner.temp }}/ai_review.md
