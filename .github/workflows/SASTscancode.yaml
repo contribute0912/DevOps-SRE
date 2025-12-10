@@ -1,42 +1,264 @@
 
-# .github/workflows/code-scanning-codeql.yml
-name: Code Scanning (CodeQL — Manual)
+name: AI Security Scan (GitHub Models — SAST Alternative)
 
 on:
-  workflow_dispatch:  # run manually from the Actions tab
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [ "main" ]          # adjust to your target branch(es)
+  workflow_dispatch:               # manual runs (optional)
 
 permissions:
   contents: read
-  security-events: write  # required to upload SARIF to Code scanning
+  pull-requests: write             # post PR comments
+  issues: write                    # add labels to PR (PRs are issues)
+  models: read                     # call GitHub Models
+
+env:
+  MODEL_ID: "openai/gpt-4.1-mini"
+  MAX_DIFF_BYTES: "80000"          # cap diff sent to model
+  MAX_FILES_BYTES: "80000"         # cap total sample bytes from files
+  FAIL_ON_SEVERITIES: "critical,high"       # gate criteria: fail on these
+  ADD_LABEL_ON_FAIL: "security:high-risk"   # label PR when gate trips (optional)
 
 jobs:
-  codeql:
+  ai-security-scan:
     runs-on: ubuntu-latest
 
-    # List only the languages you use
-    strategy:
-      fail-fast: false
-      matrix:
-        language: ['python' ]
-        # Supported: cpp, csharp, go, java, javascript, typescript, python, ruby, swift, kotlin
-
     steps:
+      - name: Sanity (all events)
+        run: |
+          echo "Event: ${{ github.event_name }}"
+          echo "Repo:  ${{ github.repository }}"
+          echo "PR #:  ${{ github.event.pull_request.number || 'n/a' }}"
+
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
-        with:
-          languages: ${{ matrix.language }}
-          # Optional: broader query pack
-          # queries: security-and-quality
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
 
-      # For compiled languages, you might need your own build step.
-      # Autobuild tries its best (safe for JS/TS/Python too).
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@v3
+      # --- Collect PR diff & changed files (base..head) ---
+      - name: Collect diff & files
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
 
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+          # Unified diff (compact)
+          git diff --unified=0 "$BASE_SHA" "$HEAD_SHA" > "$RUNNER_TEMP/pr.diff" || true
+
+          # Truncate diff if oversized
+          DIFF_SIZE=$(wc -c < "$RUNNER_TEMP/pr.diff" || echo 0)
+          if [ "$DIFF_SIZE" -gt "${MAX_DIFF_BYTES}" ]; then
+            echo "::warning::PR diff is $DIFF_SIZE bytes; truncating to ${MAX_DIFF_BYTES}."
+            head -c "${MAX_DIFF_BYTES}" "$RUNNER_TEMP/pr.diff" > "$RUNNER_TEMP/pr.diff.trunc"
+            mv "$RUNNER_TEMP/pr.diff.trunc" "$RUNNER_TEMP/pr.diff"
+          fi
+
+          # Changed files list
+          CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" | tr '\n' ' ')
+          echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
+
+          # Concatenate limited snippets from changed source files
+          : > "$RUNNER_TEMP/files_sample.txt"
+          total=0
+          for f in $CHANGED; do
+            case "$f" in
+              *.py|*.js|*.ts|*.tsx|*.jsx|*.go|*.java|*.kt|*.rb|*.php|*.cs|*.c|*.cpp)
+                if [ -f "$f" ]; then
+                  echo -e "\n===== FILE: $f =====\n" >> "$RUNNER_TEMP/files_sample.txt"
+                  append=$(( 16 * 1024 )) # ~16KB per file
+                  rem=$(( ${MAX_FILES_BYTES} - total ))
+                  [ "$rem" -lt "$append" ] && append="$rem"
+                  [ "$append" -le 0 ] && break
+                  head -c "$append" "$f" >> "$RUNNER_TEMP/files_sample.txt"
+                  total=$(( total + append ))
+                fi
+              ;;
+            esac
+          done
+
+      # --- Build strict JSON prompt for machine-readable output ---
+      - name: Build prompts (security schema)
+        if: ${{ github.event_name == 'pull_request' }}
+        run: |
+          set -euo pipefail
+
+          # SYSTEM prompt: require STRICT JSON response for gating
+          cat > "$RUNNER_TEMP/system_prompt.txt" <<'SYS'
+You are a senior application security engineer. Analyze the PR diff and file snippets.
+Return STRICT JSON ONLY, no markdown, in this exact schema:
+{
+  "vulnerabilities": [
+    {
+      "title": "short name",
+      "severity": "critical|high|medium|low",
+      "file": "path/relative",
+      "line": 123,
+      "description": "what is risky and why",
+      "evidence": "quote or hunk showing issue",
+      "suggested_fix": "concise actionable remediation"
+    }
+  ],
+  "summary": "1-2 sentence overview"
+}
+Rules:
+- Prefer evidence from the diff; if insufficient, use file snippets.
+- Focus on: injection (SQL/command), XSS, SSRF, auth/authz gaps, insecure crypto, unsafe deserialization, path traversal, secrets exposure, dangerous eval/system calls, insecure HTTP/TLS usage, open redirects, insecure cookies.
+- Only include findings with reasonable evidence.
+- Keep list concise (max ~12 findings).
+SYS
+
+          # USER payload (JSON) with diff + sample files
+          jq -n \
+            --arg repo   "${{ github.repository }}" \
+            --arg pr     "${{ github.event.pull_request.number }}" \
+            --arg title  "${{ github.event.pull_request.title }}" \
+            --arg author "${{ github.event.pull_request.user.login }}" \
+            --rawfile diff  "$RUNNER_TEMP/pr.diff" \
+            --rawfile files "$RUNNER_TEMP/files_sample.txt" \
+            '{
+              task: "Security review of PR code changes",
+              repo: $repo,
+              pr_number: $pr,
+              pr_title: $title,
+              author: $author,
+              diff_unified: $diff,
+              changed_files_sample: $files
+            }' > "$RUNNER_TEMP/user_payload.json"
+
+      # --- Call GitHub Models and validate STRICT JSON ---
+      - name: Call GitHub Models (LLM security scan)
+        if: ${{ github.event_name == 'pull_request' }}
+        id: ai
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          SYS=$(cat "$RUNNER_TEMP/system_prompt.txt")
+          USER=$(cat "$RUNNER_TEMP/user_payload.json")
+
+          PAYLOAD=$(jq -n \
+            --arg model "${MODEL_ID}" \
+            --arg sys "$SYS" \
+            --arg user "$USER" \
+            '{ model: $model,
+               messages: [
+                 {"role":"system","content":$sys},
+                 {"role":"user","content":$user}
+               ],
+               temperature: 0.2 }')
+
+          RESPONSE=$(curl -sSL -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/json" \
+            https://models.github.ai/inference/chat/completions \
+            -d "$PAYLOAD")
+
+          CONTENT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // ""')
+          [ -z "$CONTENT" ] && CONTENT='{"vulnerabilities":[],"summary":"Model returned no content."}'
+
+          # Salvage pure JSON if any prose wraps it (first { to last })
+          printf "%s" "$CONTENT" > "$RUNNER_TEMP/ai_raw.txt"
+          sed -n '1h;1!H;${;g;s/^[^{]*{/{/;s/}[^}]*$/}/;p;}' "$RUNNER_TEMP/ai_raw.txt" > "$RUNNER_TEMP/ai_maybe.json" || true
+
+          # Validate JSON; fallback to empty list if invalid
+          if jq -e . "$RUNNER_TEMP/ai_maybe.json" > /dev/null 2>&1; then
+            jq '.' "$RUNNER_TEMP/ai_maybe.json" > "$RUNNER_TEMP/ai.json"
+          else
+            echo "::warning::AI output invalid JSON; using empty findings."
+            echo '{"vulnerabilities":[],"summary":"Invalid JSON from model."}' > "$RUNNER_TEMP/ai.json"
+          fi
+
+          echo "json<<AI_JSON" >> "$GITHUB_OUTPUT"
+          cat "$RUNNER_TEMP/ai.json" >> "$GITHUB_OUTPUT"
+          echo "AI_JSON" >> "$GITHUB_OUTPUT"
+
+      # --- Gate: fail on critical/high (configurable via env) ---
+      - name: Evaluate gate (fail on configured severities)
+        if: ${{ github.event_name == 'pull_request' }}
+        id: gate
+        run: |
+          set -euo pipefail
+          FAIL_SET="$(echo "${FAIL_ON_SEVERITIES}" | tr '[:upper:]' '[:lower:]' | tr ',' ' ')"
+          AI_JSON="$RUNNER_TEMP/ai.json"
+
+          # Extract highest severity present
+          SEVS=$(jq -r '.vulnerabilities[].severity // empty' "$AI_JSON" | tr '[:upper:]' '[:lower:]')
+          GATE_HIT="false"
+          for s in $SEVS; do
+            for bad in $FAIL_SET; do
+              if [ "$s" = "$bad" ]; then
+                GATE_HIT="true"
+              fi
+            done
+          done
+
+          echo "gate_hit=$GATE_HIT" >> "$GITHUB_OUTPUT"
+
+          # Build human-readable comment from JSON
+          SUMMARY=$(jq -r '.summary // ""' "$AI_JSON")
+          {
+            echo "### 🔐 AI Security Scan (GitHub Models)"
+            echo
+            echo "**Summary:** $SUMMARY"
+            echo
+            COUNT=$(jq -r '.vulnerabilities | length' "$AI_JSON")
+            echo "**Findings ($COUNT):**"
+            echo
+            jq -r '.vulnerabilities[] | "- **[" + (.severity // "n/a") + "]** " + (.title // "untitled") + " (`" + (.file // "unknown") + ":" + ((.line // 0)|tostring) + "`)\n  - Evidence: " + (.evidence // "n/a") + "\n  - Why: " + (.description // "n/a") + "\n  - Fix: " + (.suggested_fix // "n/a") + "\n"' "$AI_JSON"
+          } > "$RUNNER_TEMP/ai_review.md"
+
+          # If gate hit, exit non-zero to block merge (if branch protection requires passing checks)
+          if [ "$GATE_HIT" = "true" ]; then
+            echo "::warning::Gate tripped (severity in ${FAIL_ON_SEVERITIES}); job will fail after posting comment."
+          fi
+
+          # Persist a flag for next steps
+          if [ "$GATE_HIT" = "true" ]; then
+            echo "result=fail" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=pass" >> "$GITHUB_OUTPUT"
+          fi
+
+      # --- Post comment with findings ---
+      - name: Comment on PR with AI review
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --repo "${{ github.repository }}" \
+            --body-file "$RUNNER_TEMP/ai_review.md"
+
+      # --- Optional: add label if gate hit ---
+      - name: Label PR when gate fails
+        if: ${{ github.event_name == 'pull_request' && steps.gate.outputs.result == 'fail' && env.ADD_LABEL_ON_FAIL != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr edit ${{ github.event.pull_request.number }} \
+            --add-label "${{ env.ADD_LABEL_ON_FAIL }}" \
+            --repo "${{ github.repository }}" || true
+
+      # --- Fail job to enforce gate (blocks merge if required checks enabled) ---
+      - name: Enforce gate (fail on high/critical)
+        if: ${{ github.event_name == 'pull_request' && steps.gate.outputs.result == 'fail' }}
+        run: |
+          echo "Failing job due to High/Critical findings."
+          exit 1
+
+      # Manual runs: attach artifact for viewing outside PR
+      - name: Upload review artifact (manual runs)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: actions/upload-artifact@v4
         with:
-          category: '/language:${{ matrix.language }}'
+          name: ai-security-scan
+          path: ${{ runner.temp }}/ai_review.md
