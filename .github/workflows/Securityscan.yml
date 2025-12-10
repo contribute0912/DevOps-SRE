@@ -43,14 +43,14 @@ jobs:
       # Optional: capture repo context for the model (limits size)
       - name: Collect lightweight repo context
         run: |
-          { \
-            echo "# Repo overview"; \
-            git ls-files | sed 's/^/- /' | head -n 400; \
-            echo ""; \
-            echo "# Top-level config files"; \
-            for f in package.json requirements.txt pyproject.toml pom.xml build.gradle Dockerfile *.tf; do \
-              [ -f "$f" ] && { echo "## $f"; head -n 200 "$f"; echo ""; }; \
-            done; \
+          {
+            echo "# Repo overview"
+            git ls-files | sed 's/^/- /' | head -n 400
+            echo ""
+            echo "# Top-level config files"
+            for f in package.json requirements.txt pyproject.toml pom.xml build.gradle Dockerfile *.tf; do
+              [ -f "$f" ] && { echo "## $f"; head -n 200 "$f"; echo ""; }
+            done
           } > "$RUNNER_TEMP/repo_context.txt"
 
       # Call GitHub Models for security analysis
