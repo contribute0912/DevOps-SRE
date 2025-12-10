@@ -144,14 +144,17 @@ jobs:
       - name: Apply labels (single gh call, no checkout)
         if: ${{ steps.labels.outputs.labels != '' }}
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # gh CLI uses GH_TOKEN
         run: |
           if [ ! -s final_labels.txt ]; then
             echo "No labels to apply."
             exit 0
           fi
           LABELS=$(paste -sd, final_labels.txt)
-          gh issue edit ${{ github.event.issue.number }} --add-label "$LABELS" --repo "${{ github.repository }}"
+          echo "Applying labels: $LABELS to issue #${{ github.event.issue.number }} in ${{ github.repository }}"
+          gh issue edit ${{ github.event.issue.number }} \
+            --add-label "$LABELS" \
+            --repo "${{ github.repository }}"
 
       - name: Post priority response (optional)
         env:
