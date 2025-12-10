@@ -1,5 +1,5 @@
 
-name: AI Security Scan (GitHub Models)
+name: Security Scan (GitHub Models)
 
 on:
   pull_request:
@@ -10,8 +10,8 @@ on:
 permissions:
   contents: read
   pull-requests: write
-  issues: write
-  models: read   # required to call GitHub Models
+  models: read
+
 
 jobs:
   ai-security:
