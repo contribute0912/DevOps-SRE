@@ -141,20 +141,32 @@ jobs:
               -f description="Auto-created by triage workflow" || true
           done < final_labels.txt
 
+
       - name: Apply labels (single gh call, no checkout)
         if: ${{ steps.labels.outputs.labels != '' }}
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # gh CLI uses GH_TOKEN
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # gh CLI reads GH_TOKEN
         run: |
           if [ ! -s final_labels.txt ]; then
             echo "No labels to apply."
             exit 0
           fi
+      
+          # Issue number from event context
+          ISSUE_NUM="${{ github.event.issue.number }}"
+          if [ -z "$ISSUE_NUM" ]; then
+            echo "::error::Issue number is empty. This step only works on 'issues' events."
+            exit 1
+          fi
+      
+          # Join labels with commas (one gh call)
           LABELS=$(paste -sd, final_labels.txt)
-          echo "Applying labels: $LABELS to issue #${{ github.event.issue.number }} in ${{ github.repository }}"
-          gh issue edit ${{ github.event.issue.number }} \
+      
+          echo "Applying labels: $LABELS to issue #$ISSUE_NUM in ${{ github.repository }}"
+          gh issue edit "$ISSUE_NUM" \
             --add-label "$LABELS" \
             --repo "${{ github.repository }}"
+
 
       - name: Post priority response (optional)
         env:
