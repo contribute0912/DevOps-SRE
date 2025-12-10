@@ -178,15 +178,22 @@ jobs:
               -f description="Auto-created by triage workflow" || true
           done < final_labels.txt
 
+
       - name: Apply labels to the issue
         if: ${{ steps.labels.outputs.labels != '' }}
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # gh uses GH_TOKEN
         run: |
+          if [ ! -s final_labels.txt ]; then
+            echo "No labels to apply (final_labels.txt empty or missing)."
+            exit 0
+          fi
           while IFS= read -r lbl; do
             [ -z "$lbl" ] && continue
-            gh issue edit ${{ github.event.issue.number }} --add-label "$lbl"
+            echo "Applying label: $lbl"
+            gh issue edit ${{ github.event.issue.number }} --add-label "$lbl" --repo "${{ github.repository }}"
           done < final_labels.txt
+
 
       - name: Post priority suggested response (with optional team mention)
         env:
