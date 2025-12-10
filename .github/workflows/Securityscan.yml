@@ -1,0 +1,121 @@
+
+name: AI Security Scan (GitHub Models)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  models: read   # required to call GitHub Models
+
+jobs:
+  ai-security:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Sanity step (runs on all events)
+        run: |
+          echo "Event: ${{ github.event_name }}"
+          echo "Ref:   ${{ github.ref }}"
+          echo "SHA:   ${{ github.sha }}"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      # Capture PR diff (same pattern you use)
+      - name: Get PR diff to file
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr diff ${{ github.event.pull_request.number }} \
+            --repo "${{ github.repository }}" \
+            > "$RUNNER_TEMP/pr.diff"
+
+      # Optional: capture repo context for the model (limits size)
+      - name: Collect lightweight repo context
+        run: |
+          { \
+            echo "# Repo overview"; \
+            git ls-files | sed 's/^/- /' | head -n 400; \
+            echo ""; \
+            echo "# Top-level config files"; \
+            for f in package.json requirements.txt pyproject.toml pom.xml build.gradle Dockerfile *.tf; do \
+              [ -f "$f" ] && { echo "## $f"; head -n 200 "$f"; echo ""; }; \
+            done; \
+          } > "$RUNNER_TEMP/repo_context.txt"
+
+      # Call GitHub Models for security analysis
+      - name: AI security review via GitHub Models (curl)
+        if: ${{ github.event_name == 'pull_request' }}
+        id: ai
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Compose prompt
+          SYS_PROMPT=$(cat << 'EOF'
+You are a meticulous application security engineer. Review only the provided Git diffs.
+Output a concise vulnerability report with:
+- Summary table: {title, severity [Critical/High/Medium/Low], file:line, category (e.g., CWE/OWASP), confidence}
+- Details per finding: brief reasoning, affected snippet (redacted secrets), exploitability, and precise fix suggestions (code diffs if trivial).
+- Ignore non-security nitpicks. If no issues: state "No material security risks observed in diff."
+Assume modern best practices for web/backends: authN/Z, input validation, crypto, secrets, dependency risks, deserialization, SSRF, path traversal, injection, XSS, CSRF, RCE, insecure defaults, logging leaks, error handling, DoS, privilege escalation.
+EOF
+)
+
+          USER_PROMPT=$(printf "Analyze the PR diff for security vulnerabilities.\n\n## Repo context (partial)\n%s\n\n## Git diff\n%s" \
+            "$(head -c 40000 "$RUNNER_TEMP/repo_context.txt")" \
+            "$(head -c 200000 "$RUNNER_TEMP/pr.diff")")
+
+          PAYLOAD=$(jq -n \
+            --arg model "openai/gpt-4.1-mini" \
+            --arg sys "$SYS_PROMPT" \
+            --arg user "$USER_PROMPT" \
+            '{
+              model: $model,
+              messages: [
+                { "role": "system", "content": $sys },
+                { "role": "user",   "content": $user }
+              ]
+            }')
+
+          RESPONSE=$(curl -sSL -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/json" \
+            https://models.github.ai/inference/chat/completions \
+            -d "${PAYLOAD}")
+
+          COMPLETION=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty')
+
+          if [ -z "$COMPLETION" ]; then
+            echo "completion<<AI_EOF" >> "$GITHUB_OUTPUT"
+            printf ":warning: AI security review returned no content.\n\n\`\`\`json\n%s\n\`\`\`\n" "$RESPONSE" >> "$GITHUB_OUTPUT"
+            echo "AI_EOF" >> "$GITHUB_OUTPUT"
+          else
+            echo "completion<<AI_EOF" >> "$GITHUB_OUTPUT"
+            printf "%s\n" "$COMPLETION" >> "$GITHUB_OUTPUT"
+            echo "AI_EOF" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Post the security comment
+      - name: Comment on PR with AI security review
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BODY_FILE="$RUNNER_TEMP/ai_security_review.md"
+          printf "%s\n" "${{ steps.ai.outputs.completion }}" > "$BODY_FILE"
+
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --repo "${{ github.repository }}" \
+            --body-file "$BODY_FILE"
