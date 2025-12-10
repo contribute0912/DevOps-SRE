@@ -4,8 +4,25 @@ name: AI PR Security Review (GitHub Models)
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-    branches: [ "main" ]          # adjust/remove to fit your target branches
-  workflow_dispatch:               # manual trigger (optional)
+    branches: ["main"]          # adjust/remove to fit your target branches
+  workflow_dispatch:            # manual trigger
+    inputs:
+      pr_number:
+        description: "PR number to review (optional). If blank, analyzes current ref only."
+        required: false
+        type: string
+      model_id:
+        description: "Override model (default: openai/gpt-4.1-mini)"
+        required: false
+        type: string
+      max_diff_bytes:
+        description: "Cap diff size sent to the model (default: 80000)"
+        required: false
+        type: string
+      max_files_bytes:
+        description: "Cap sample bytes from changed files (default: 80000)"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -14,9 +31,9 @@ permissions:
   # issues: write                  # uncomment only if you plan to add labels to the PR
 
 env:
-  MODEL_ID: "openai/gpt-4.1-mini"
-  MAX_DIFF_BYTES: "80000"          # cap diff size sent to the model
-  MAX_FILES_BYTES: "80000"         # cap total sample bytes from changed files
+  MODEL_ID: ${{ inputs.model_id || 'openai/gpt-4.1-mini' }}
+  MAX_DIFF_BYTES: ${{ inputs.max_diff_bytes || '80000' }}
+  MAX_FILES_BYTES: ${{ inputs.max_files_bytes || '80000' }}
 
 jobs:
   review:
@@ -27,12 +44,15 @@ jobs:
         run: |
           echo "Event: ${{ github.event_name }}"
           echo "Repo:  ${{ github.repository }}"
-          echo "PR #:  ${{ github.event.pull_request.number || 'n/a' }}"
+          echo "PR #:  ${{ github.event.pull_request.number || inputs.pr_number || 'n/a' }}"
           echo "Ref:   ${{ github.ref }}"
           echo "SHA:   ${{ github.sha }}"
 
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # For manual runs, ensure full history to diff if needed
+          fetch-depth: 0
 
       - name: Ensure jq and gh CLI
         run: |
@@ -41,13 +61,51 @@ jobs:
           gh --version || (type -p curl >/dev/null || sudo apt-get install -y curl && \
             curl -fsSL https://raw.githubusercontent.com/cli/cli/trunk/script/install.sh | sudo bash)
 
-      # Collect compact diff and sample snippets of changed files (base..head)
-      - name: Collect PR diff & changed files
-        if: ${{ github.event_name == 'pull_request' }}
+      # Resolve BASE and HEAD SHAs depending on event type
+      - name: Resolve base/head SHAs
+        id: sha
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          BASE_SHA="${{ github.event.pull_request.base.sha }}"
-          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+            PR_NUM="${{ github.event.pull_request.number }}"
+          else
+            # workflow_dispatch: try to use PR number if provided
+            PR_INPUT="${{ inputs.pr_number || '' }}"
+            if [ -n "$PR_INPUT" ]; then
+              echo "Resolving PR #$PR_INPUT via gh api..."
+              # Get base/head SHAs from the PR
+              PR_JSON=$(gh api repos/${{ github.repository }}/pulls/$PR_INPUT)
+              BASE_SHA=$(echo "$PR_JSON" | jq -r '.base.sha')
+              HEAD_SHA=$(echo "$PR_JSON" | jq -r '.head.sha')
+              PR_NUM="$PR_INPUT"
+              echo "Found PR base:$BASE_SHA head:$HEAD_SHA"
+              # Ensure both SHAs exist locally (fetch the PR refs)
+              git fetch origin "$BASE_SHA" "$HEAD_SHA" || git fetch --all --prune
+            else
+              # No PR provided: analyze the current ref only
+              # Use previous commit as base and current HEAD as head for a minimal diff
+              HEAD_SHA=$(git rev-parse HEAD)
+              BASE_SHA=$(git rev-parse HEAD~1 || echo "$HEAD_SHA")
+              PR_NUM=""
+              echo "::warning::No PR number provided; will analyze HEAD vs HEAD~1."
+            fi
+          fi
+
+          echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "pr_num=$PR_NUM"     >> "$GITHUB_OUTPUT"
+
+      # Collect compact diff and sample snippets of changed files
+      - name: Collect diff & changed files
+        run: |
+          set -euo pipefail
+          BASE_SHA="${{ steps.sha.outputs.base_sha }}"
+          HEAD_SHA="${{ steps.sha.outputs.head_sha }}"
 
           # Unified (compact) diff to keep payload small
           git diff --unified=0 "$BASE_SHA" "$HEAD_SHA" > "$RUNNER_TEMP/pr.diff" || true
@@ -83,10 +141,10 @@ jobs:
 
       # Build a security-focused SYSTEM prompt and a JSON USER payload
       - name: Build AI prompts (security review)
-        if: ${{ github.event_name == 'pull_request' }}
         run: |
           set -euo pipefail
 
+          PR_NUM="${{ steps.sha.outputs.pr_num }}"
           # SYSTEM prompt (Markdown output)
           cat > "$RUNNER_TEMP/system_prompt.txt" <<'SYS'
 You are a senior application security engineer. Review the provided PR diff and file snippets.
@@ -103,13 +161,13 @@ SYS
           # USER payload as JSON to preserve content safely
           jq -n \
             --arg repo   "${{ github.repository }}" \
-            --arg pr     "${{ github.event.pull_request.number }}" \
-            --arg title  "${{ github.event.pull_request.title }}" \
-            --arg author "${{ github.event.pull_request.user.login }}" \
+            --arg pr     "${PR_NUM}" \
+            --arg title  "${{ github.event.pull_request.title || github.ref }}" \
+            --arg author "${{ github.event.pull_request.user.login || github.actor }}" \
             --rawfile diff  "$RUNNER_TEMP/pr.diff" \
             --rawfile files "$RUNNER_TEMP/files_sample.txt" \
             '{
-              task: "Security review of PR code changes. Return STRICT Markdown with sections.",
+              task: "Security review of code changes. Return STRICT Markdown with sections.",
               repo: $repo,
               pr_number: $pr,
               pr_title: $title,
@@ -125,7 +183,6 @@ SYS
 
       # Call GitHub Models with the prompts
       - name: AI code review via GitHub Models (curl)
-        if: ${{ github.event_name == 'pull_request' }}
         id: ai
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -168,17 +225,17 @@ SYS
           printf "%s\n" "$COMPLETION" >> "$GITHUB_OUTPUT"
           echo "AI_EOF" >> "$GITHUB_OUTPUT"
 
-      # Post the AI review as a PR comment
+      # Post the AI review as a PR comment if we have a PR number
       - name: Comment on PR with AI review
-        if: ${{ github.event_name == 'pull_request' }}
+        if: ${{ steps.sha.outputs.pr_num != '' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh pr comment ${{ github.event.pull_request.number }} \
+          gh pr comment ${{ steps.sha.outputs.pr_num }} \
             --repo "${{ github.repository }}" \
             --body-file "$RUNNER_TEMP/ai_review.md"
 
-      # Optional: also expose review as an artifact for manual runs
+      # Always expose review as an artifact in manual runs
       - name: Upload review artifact (manual runs)
         if: ${{ github.event_name == 'workflow_dispatch' }}
         uses: actions/upload-artifact@v4
