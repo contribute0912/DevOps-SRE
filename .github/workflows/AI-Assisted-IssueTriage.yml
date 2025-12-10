@@ -1,5 +1,5 @@
 
-name: Simple AI Triage (Team & Priority Response)
+name: Simple AI Issue Triage
 
 on:
   issues:
@@ -13,39 +13,21 @@ permissions:
 env:
   MODEL_ID: "openai/gpt-4.1-mini"
 
-  # === Label maps (edit to match your repo) ===
+  # --- Label maps (edit to match your repo) ---
   SEVERITY_LABELS_JSON: |
     { "critical": "severity:critical", "high": "severity:high", "medium": "severity:medium", "low": "severity:low" }
   PRIORITY_LABELS_JSON: |
     { "P0": "priority:P0", "P1": "priority:P1", "P2": "priority:P2", "P3": "priority:P3" }
   TEAM_LABELS_JSON: |
-    {
-      "frontend": "team:frontend",
-      "backend": "team:backend",
-      "platform": "team:platform",
-      "infra": "team:infra",
-      "security": "team:security",
-      "docs": "team:docs"
-    }
+    { "frontend": "team:frontend", "backend": "team:backend", "platform": "team:platform", "infra": "team:infra", "security": "team:security", "docs": "team:docs" }
 
-  # === Optional team mentions (fill in your org/team handles or leave empty) ===
-  TEAM_MENTIONS_JSON: |
-    {
-      "frontend": "@your-org/frontend-team",
-      "backend": "@your-org/backend-team",
-      "platform": "@your-org/platform-team",
-      "infra": "@your-org/infra-team",
-      "security": "@your-org/security-team",
-      "docs": "@your-org/docs-team"
-    }
-
-  # === Priority-based suggested response templates ===
+  # --- Optional: priority-based response templates ---
   PRIORITY_RESPONSE_TEMPLATES_JSON: |
     {
-      "P0": "We recognize this as top priority (P0). The on-call team is investigating immediately. We aim to provide an update within 2 hours.",
-      "P1": "Thanks for the report. Marked as P1. We'll triage and share a plan within 1 business day.",
-      "P2": "Thanks! Marked as P2. We'll review in the next sprint planning and update this issue accordingly.",
-      "P3": "Appreciate the input. Marked as P3 for backlog consideration. We'll revisit when capacity allows."
+      "P0": "Marked as P0. The on-call is investigating immediately; update within 2 hours.",
+      "P1": "Marked as P1. We'll share a triage plan within 1 business day.",
+      "P2": "Marked as P2. We’ll review in the next sprint planning.",
+      "P3": "Marked as P3. Added to backlog; we'll revisit when capacity allows."
     }
 
 jobs:
@@ -53,18 +35,18 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Install jq and GitHub CLI
+      - name: Install jq and gh
         run: |
-          sudo apt-get update
+          sudo apt-get update -y
           sudo apt-get install -y jq
           gh --version || (type -p curl >/dev/null || sudo apt-get install -y curl && \
             curl -fsSL https://raw.githubusercontent.com/cli/cli/trunk/script/install.sh | sudo bash)
 
-      - name: Build AI prompt
+      - name: Build prompt
         run: |
           cat > prompt.json <<'JSON'
           {
-            "task": "Classify this GitHub issue and return STRICT JSON only.",
+            "task": "Classify this issue and return STRICT JSON only.",
             "schema": {
               "category": ["bug","feature","docs","question","chore","security","performance","other"],
               "severity": ["critical","high","medium","low","null"],
@@ -89,9 +71,9 @@ jobs:
         run: |
           PAYLOAD=$(jq -n \
             --arg model "$MODEL_ID" \
-            --arg sys "You are a precise issue triager. Output STRICT JSON only with keys: category, severity, priority, team, labels." \
+            --arg sys 'You are a precise issue triager. Output STRICT JSON only with keys: category, severity, priority, team, labels.' \
             --arg user "$(cat prompt.json)" \
-            '{model:$model, messages:[{"role":"system","content":$sys},{"role":"user","content":$user}], "temperature":0.2}')
+            '{model:$model, messages:[{"role":"system","content":$sys},{"role":"user","content":$user}], temperature:0.2}')
 
           RESPONSE=$(curl -sS -X POST \
             -H "Accept: application/vnd.github+json" \
@@ -102,26 +84,18 @@ jobs:
             -d "$PAYLOAD")
 
           CONTENT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty')
-          if [ -z "$CONTENT" ]; then
-            echo "::warning::Model returned empty content; using defaults."
-            CONTENT='{"category":"other","severity":"null","priority":"null","team":"null","labels":[]}'
-          fi
-
+          [ -z "$CONTENT" ] && CONTENT='{"category":"other","severity":"null","priority":"null","team":"null","labels":[]}'
           printf "%s" "$CONTENT" > triage_raw.txt
-          # Extract from first '{' to last '}' in case the model added prose
-          sed -n '1h;1!H;${;g;s/^[^{]*{/{/;s/}[^}]*$/}/;p;}' triage_raw.txt > triage_maybe.json || true
 
+          # Extract JSON between first '{' and last '}' (in case of prose)
+          sed -n '1h;1!H;${;g;s/^[^{]*{/{/;s/}[^}]*$/}/;p;}' triage_raw.txt > triage_maybe.json || true
           if jq -e . triage_maybe.json >/dev/null 2>&1; then
             jq '.' triage_maybe.json > triage.json
           else
-            echo "::warning::AI output not valid JSON; using defaults."
             echo '{"category":"other","severity":"null","priority":"null","team":"null","labels":[]}' > triage.json
           fi
 
-          echo "AI triage JSON:"
-          cat triage.json
-
-      - name: Compute label set (category + severity + priority + team)
+      - name: Compute labels (category + severity + priority + team)
         id: labels
         env:
           SEVERITY_LABELS_JSON: ${{ env.SEVERITY_LABELS_JSON }}
@@ -133,15 +107,9 @@ jobs:
           PRI_KEY=$(jq -r '.priority // empty' triage.json)
           TEAM_KEY=$(jq -r '.team // empty' triage.json)
 
-          # Start with AI-proposed labels
           jq -r '.labels[]? // empty' triage.json > labels.tmp || true
+          [ -n "$CATEGORY" ] && [ "$CATEGORY" != "null" ] && echo "$CATEGORY" >> labels.tmp
 
-          # Optional category as label
-          if [ -n "$CATEGORY" ] && [ "$CATEGORY" != "null" ]; then
-            echo "$CATEGORY" >> labels.tmp
-          fi
-
-          # Map severity/priority/team keys -> repo labels
           SEV_LABEL=$(jq -r --arg k "$SEV_KEY" '.[$k] // empty' <<< "$SEVERITY_LABELS_JSON")
           PRI_LABEL=$(jq -r --arg k "$PRI_KEY" '.[$k] // empty' <<< "$PRIORITY_LABELS_JSON")
           TEAM_LABEL=$(jq -r --arg k "$TEAM_KEY" '.[$k] // empty' <<< "$TEAM_LABELS_JSON")
@@ -150,18 +118,13 @@ jobs:
           [ -n "$PRI_LABEL" ] && echo "$PRI_LABEL" >> labels.tmp
           [ -n "$TEAM_LABEL" ] && echo "$TEAM_LABEL" >> labels.tmp
 
-          # Deduplicate
           (cat labels.tmp 2>/dev/null || true) | awk 'NF' | sort -u > final_labels.txt
 
           echo "labels<<EOF" >> $GITHUB_OUTPUT
           cat final_labels.txt >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-          # Also expose keys for later steps
-          echo "severity=$SEV_KEY" >> $GITHUB_OUTPUT
           echo "priority=$PRI_KEY" >> $GITHUB_OUTPUT
-          echo "team_key=$TEAM_KEY" >> $GITHUB_OUTPUT
-          echo "team_label=$TEAM_LABEL" >> $GITHUB_OUTPUT
 
       - name: Ensure labels exist
         if: ${{ steps.labels.outputs.labels != '' }}
@@ -178,61 +141,42 @@ jobs:
               -f description="Auto-created by triage workflow" || true
           done < final_labels.txt
 
-
-      - name: Apply labels to the issue
+      - name: Apply labels (single gh call, no checkout)
         if: ${{ steps.labels.outputs.labels != '' }}
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # gh uses GH_TOKEN
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if [ ! -s final_labels.txt ]; then
-            echo "No labels to apply (final_labels.txt empty or missing)."
+            echo "No labels to apply."
             exit 0
           fi
-          while IFS= read -r lbl; do
-            [ -z "$lbl" ] && continue
-            echo "Applying label: $lbl"
-            gh issue edit ${{ github.event.issue.number }} --add-label "$lbl" --repo "${{ github.repository }}"
-          done < final_labels.txt
+          LABELS=$(paste -sd, final_labels.txt)
+          gh issue edit ${{ github.event.issue.number }} --add-label "$LABELS" --repo "${{ github.repository }}"
 
-
-      - name: Post priority suggested response (with optional team mention)
+      - name: Post priority response (optional)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PRIORITY_RESPONSE_TEMPLATES_JSON: ${{ env.PRIORITY_RESPONSE_TEMPLATES_JSON }}
-          TEAM_MENTIONS_JSON: ${{ env.TEAM_MENTIONS_JSON }}
         run: |
-          PRI_KEY="${{ steps.labels.outputs.priority }}"
-          TEAM_KEY="${{ steps.labels.outputs.team_key }}"
-          TEAM_LABEL="${{ steps.labels.outputs.team_label }}"
-
-          # Resolve response by priority
-          RESP=$(jq -r --arg k "$PRI_KEY" '.[$k] // empty' <<< "$PRIORITY_RESPONSE_TEMPLATES_JSON")
-          [ -z "$RESP" ] && RESP="Thanks! We've recorded this and will update the issue once there is progress."
-
-          # Optional team mention
-          TEAM_MENTION=$(jq -r --arg k "$TEAM_KEY" '.[$k] // empty' <<< "$TEAM_MENTIONS_JSON")
-          TEAM_LINE=""
-          if [ -n "$TEAM_MENTION" ] && [ "$TEAM_MENTION" != "null" ]; then
-            TEAM_LINE="Routing to $TEAM_MENTION."
-          elif [ -n "$TEAM_LABEL" ]; then
-            TEAM_LINE="Routing via label \`${TEAM_LABEL}\`."
-          fi
+          PRI="${{ steps.labels.outputs.priority }}"
+          RESP=$(jq -r --arg k "$PRI" '.[$k] // empty' <<< "$PRIORITY_RESPONSE_TEMPLATES_JSON")
+          [ -z "$RESP" ] && RESP="Thanks! We’ve recorded this and will update with progress."
 
           CAT=$(jq -r '.category // "other"' triage.json)
           SEV=$(jq -r '.severity // "n/a"' triage.json)
-          PRI=$(jq -r '.priority // "n/a"' triage.json)
+          PRI_VAL=$(jq -r '.priority // "n/a"' triage.json)
           TEAM=$(jq -r '.team // "n/a"' triage.json)
 
           {
             echo "### 🤖 Auto-triage summary"
             echo "- **Category:** \`$CAT\`"
             echo "- **Severity:** \`$SEV\`"
-            echo "- **Priority:** \`$PRI\`"
+            echo "- **Priority:** \`$PRI_VAL\`"
             echo "- **Team:** \`$TEAM\`"
             echo
             echo "$RESP"
-            [ -n "$TEAM_LINE" ] && echo "$TEAM_LINE"
             echo
-            echo "_Posted by Simple AI Triage (GitHub Models: $MODEL_ID)._"
-          } > priority_comment.md
+            echo "_Posted by Simple AI Triage (Model: $MODEL_ID)._"
+          } > comment.md
 
+          gh issue comment ${{ github.event.issue.number }} --body-file comment.md --repo "${{ github.repository }}"
