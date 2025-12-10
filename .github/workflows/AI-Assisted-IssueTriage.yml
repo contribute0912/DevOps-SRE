@@ -1,400 +1,55 @@
-name: AI Issue Triage (GitHub Models)
+
+name: Simple AI Issue Triage (with Severity & Priority)
 
 on:
   issues:
-    types: [opened, edited, reopened, labeled, unlabeled]
-  issue_comment:
-    types: [created]
+    types: [opened, edited, reopened]
   workflow_dispatch:
-    inputs:
-      issue_number:
-        description: "Issue number to triage (optional; defaults to event issue)"
-        required: false
-        type: string
 
 permissions:
   contents: read
   issues: write
-  pull-requests: read
-  models: read
 
 env:
-  # ======= Customize these to your team/repo conventions =======
   MODEL_ID: "openai/gpt-4.1-mini"
-  # Map of "keyword or area" -> labels to add. AI will use this context; we also apply AI-proposed labels.
-  LABEL_HINTS_JSON: >
-    {
-      "bug": ["bug"],
-      "regression": ["regression", "bug"],
-      "security": ["security"],
-      "perf": ["performance"],
-      "docs": ["documentation"],
-      "ux": ["ux"],
-      "frontend": ["area:frontend"],
-      "backend": ["area:backend"],
-      "api": ["area:api"],
-      "infra": ["area:infra"],
-      "test": ["area:test"]
-    }
-  # Convert AI priority to labels you use
-  PRIORITY_LABELS_JSON: >
+  # Map model outputs -> your label names (edit to match your repo)
+  PRIORITY_LABELS_JSON: |
     {
       "P0": "priority:P0",
       "P1": "priority:P1",
       "P2": "priority:P2",
       "P3": "priority:P3"
     }
-  # Convert AI severity to labels you use
-  SEVERITY_LABELS_JSON: >
+  SEVERITY_LABELS_JSON: |
     {
       "critical": "severity:critical",
       "high": "severity:high",
       "medium": "severity:medium",
       "low": "severity:low"
     }
-  NEEDS_INFO_LABEL: "needs-more-info"
-  DUPLICATE_LABEL: "duplicate"
-  # When true, the workflow will close issues the model flags as a confident duplicate.
-  ALLOW_AUTO_CLOSE_DUPLICATES: "true"
-  # Limit for open issues to fetch for duplicate triage context
-  DUP_SCAN_LIMIT: "25"
 
 jobs:
   triage:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Sanity step (runs on all events)
+      - name: Install jq and GitHub CLI
         run: |
-          echo "Event: ${{ github.event_name }}"
-          echo "Ref:   ${{ github.ref }}"
-          echo "SHA:   ${{ github.sha }}"
+          sudo apt-get update
+          sudo apt-get install -y jq
+          # gh is typically preinstalled on ubuntu-latest, but this ensures it's available
+          gh --version || (type -p curl >/dev/null || sudo apt-get install -y curl && \
+            curl -fsSL https://raw.githubusercontent.com/cli/cli/trunk/script/install.sh | sudo bash)
 
-      - name: Install jq
+      - name: Build user prompt
         run: |
-          sudo apt-get update && sudo apt-get install -y jq
-
-      - name: Resolve issue number
-        id: ctx
-        run: |
-          # Determine the target issue number from event or workflow input
-          if [ -n "${{ inputs.issue_number }}" ]; then
-            ISSUE_NUM="${{ inputs.issue_number }}"
-          elif [ "${{ github.event_name }}" = "issues" ]; then
-            ISSUE_NUM="${{ github.event.issue.number }}"
-          elif [ "${{ github.event_name }}" = "issue_comment" ]; then
-            ISSUE_NUM="${{ github.event.issue.number }}"
-          else
-            echo "::error::No issue number available for this event"
-            exit 1
-          fi
-          echo "issue=${ISSUE_NUM}" >> "$GITHUB_OUTPUT"
-
-      - name: Fetch issue JSON
-        id: fetch
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh api \
-            repos/${{ github.repository }}/issues/${{ steps.ctx.outputs.issue }} \
-            --jq '.' > "$RUNNER_TEMP/issue.json"
-          cat "$RUNNER_TEMP/issue.json" | jq '{number, title, user: .user.login, body, state, labels: [.labels[].name], created_at, updated_at}' > "$RUNNER_TEMP/issue_min.json"
-          echo "Fetched issue:"
-          cat "$RUNNER_TEMP/issue_min.json"
-
-      - name: Fetch recent open issues (for potential duplicate detection)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh issue list --state open --limit "${DUP_SCAN_LIMIT}" --json number,title,author,labels,createdAt,updatedAt \
-            --jq '[ .[] | { number, title, author: .author.login, labels: [ .labels[].name ], createdAt, updatedAt } ]' \
-            > "$RUNNER_TEMP/open_issues.json"
-          echo "Recent open issues:"
-          cat "$RUNNER_TEMP/open_issues.json" | jq '.[0:5]'
-
-      - name: Build AI prompt
-        id: prompt
-        run: |
-          SYS_PROMPT=$(cat <<'SYS'
-You are an on-call triage engineer. Triage GitHub issues accurately and conservatively.
-Output STRICT JSON complying with this schema (no markdown, no extra text):
-
-{
-  "category": "bug|feature|docs|question|chore|security|performance|other",
-  "severity": "critical|high|medium|low|null",
-  "priority": "P0|P1|P2|P3|null",
-  "labels": ["string", "..."],
-  "needs_info": true|false,
-  "missing_info": ["steps_to_reproduce","expected_behavior","actual_behavior","logs","environment","version","screenshots"],
-  "assignees": ["github-username", "..."],
-  "duplicate": {
-    "is_duplicate": true|false,
-    "confidence": 0.0_to_1.0,
-    "of_issue_number": 0
-  },
-  "rationale": "Short explanation for the above decisions."
-}
-
-Rules:
-- Prefer safety: if in doubt, set "needs_info": true and add missing fields.
-- Map severity/priority only if clear from text/impact; else null.
-- Propose labels seen in the repo conventions and LABEL_HINTS_JSON and from the issue content.
-- Suggest assignees only if clearly implied (component owner mentioned); else leave empty.
-- Duplicate detection: given the provided open issues list, set is_duplicate=true only if the title/body strongly match and confidence ≥ 0.7. Include the issue number matched.
-- Keep labels concise; avoid duplicates.
-- IMPORTANT: Respond with raw JSON only. No markdown fences.
-SYS
-)
-          # Escape newlines for JSON string
-          printf "%s" "$SYS_PROMPT" > "$RUNNER_TEMP/sys_prompt.txt"
-
-          echo "system<<SYS_EOF" >> "$GITHUB_OUTPUT"
-          cat "$RUNNER_TEMP/sys_prompt.txt" >> "$GITHUB_OUTPUT"
-          echo "SYS_EOF" >> "$GITHUB_OUTPUT"
-
-      - name: Call GitHub Models for triage (curl)
-        id: ai
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          ISSUE_JSON=$(cat "$RUNNER_TEMP/issue_min.json")
-          OPEN_JSON=$(cat "$RUNNER_TEMP/open_issues.json")
-          LABEL_HINTS=${LABEL_HINTS_JSON}
-          PRIORITY_LABELS=${PRIORITY_LABELS_JSON}
-          SEVERITY_LABELS=${SEVERITY_LABELS_JSON}
-
-          USER_TEXT=$(jq -n \
-            --arg repo "${{ github.repository }}" \
-            --argjson issue "$ISSUE_JSON" \
-            --argjson open "$OPEN_JSON" \
-            --argjson hints "$LABEL_HINTS" \
-            --argjson prio "$PRIORITY_LABELS" \
-            --argjson sev "$SEVERITY_LABELS" \
-            '{
-              task: "Perform issue triage for repository",
-              repository: $repo,
-              issue: $issue,
-              recent_open_issues_sample: $open,
-              label_hints: $hints,
-              priority_label_map: $prio,
-              severity_label_map: $sev
-            }'
-          )
-
-          PAYLOAD=$(jq -n \
-            --arg model "${MODEL_ID}" \
-            --arg sys "${{ steps.prompt.outputs.system }}" \
-            --arg user "$USER_TEXT" \
-            '{
-              model: $model,
-              messages: [
-                {"role": "system", "content": $sys},
-                {"role": "user", "content": $user}
-              ],
-              temperature: 0.2
-            }'
-          )
-
-          RESPONSE=$(curl -sS -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            -H "Content-Type: application/json" \
-            https://models.github.ai/inference/chat/completions \
-            -d "${PAYLOAD}")
-
-          CONTENT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty')
-
-          if [ -z "$CONTENT" ]; then
-            echo "Model returned no content; dumping response:"
-            echo "$RESPONSE"
-            echo "{}" > "$RUNNER_TEMP/triage_raw.txt"
-          else
-            printf "%s" "$CONTENT" > "$RUNNER_TEMP/triage_raw.txt"
-          fi
-
-          # Try to salvage JSON even if model wrapped it in prose or fences
-          # Extract between first { and last }
-          sed -n '1h;1!H;${;g;s/^[^{]*{/{/;s/}[^}]*$/}/;p;}' "$RUNNER_TEMP/triage_raw.txt" > "$RUNNER_TEMP/triage_maybe.json" || true
-
-          if jq -e . "$RUNNER_TEMP/triage_maybe.json" > /dev/null 2>&1; then
-            cat "$RUNNER_TEMP/triage_maybe.json" | jq '.' > "$RUNNER_TEMP/triage.json"
-          else
-            echo "::warning::AI output was not valid JSON. Falling back to minimal triage."
-            echo '{"category":"other","severity":null,"priority":null,"labels":[],"needs_info":false,"missing_info":[],"assignees":[],"duplicate":{"is_duplicate":false,"confidence":0.0,"of_issue_number":0},"rationale":"fallback"}' > "$RUNNER_TEMP/triage.json"
-          fi
-
-          echo "triage<<JSON_EOF" >> "$GITHUB_OUTPUT"
-          cat "$RUNNER_TEMP/triage.json" >> "$GITHUB_OUTPUT"
-          echo "JSON_EOF" >> "$GITHUB_OUTPUT"
-
-      - name: Compute final label set (AI + conventions)
-        id: labels
-        run: |
-          TRIAGE="$RUNNER_TEMP/triage.json"
-          ISSUE="$RUNNER_TEMP/issue_min.json"
-
-          # Start with AI-proposed labels
-          mapfile -t LABELS < <(jq -r '.labels[]?' "$TRIAGE")
-
-          # Add severity/priority mapped labels if present
-          SEV_KEY=$(jq -r '.severity // empty' "$TRIAGE")
-          PRIO_KEY=$(jq -r '.priority // empty' "$TRIAGE")
-
-          if [ -n "$SEV_KEY" ] && [ "$SEV_KEY" != "null" ]; then
-            SEV_LABEL=$(jq -r --arg k "$SEV_KEY" '.[$k] // empty' <<< "${SEVERITY_LABELS_JSON}")
-            [ -n "$SEV_LABEL" ] && LABELS+=("$SEV_LABEL")
-          fi
-
-          if [ -n "$PRIO_KEY" ] && [ "$PRIO_KEY" != "null" ]; then
-            PRIO_LABEL=$(jq -r --arg k "$PRIO_KEY" '.[$k] // empty' <<< "${PRIORITY_LABELS_JSON}")
-            [ -n "$PRIO_LABEL" ] && LABELS+=("$PRIO_LABEL")
-          fi
-
-          # Add NEEDS_INFO_LABEL if needed
-          NEEDS_INFO=$(jq -r '.needs_info' "$TRIAGE")
-          if [ "$NEEDS_INFO" = "true" ]; then
-            LABELS+=("${NEEDS_INFO_LABEL}")
-          fi
-
-          # Deduplicate and filter empties
-          printf '%s\n' "${LABELS[@]}" | awk 'NF' | sort -u > "$RUNNER_TEMP/final_labels.txt"
-          echo "labels<<LBL_EOF" >> "$GITHUB_OUTPUT"
-          cat "$RUNNER_TEMP/final_labels.txt" >> "$GITHUB_OUTPUT"
-          echo "LBL_EOF" >> "$GITHUB_OUTPUT"
-
-      - name: Ensure labels exist (create if missing)
-        if: ${{ steps.labels.outputs.labels != '' }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          while IFS= read -r lbl; do
-            [ -z "$lbl" ] && continue
-            # Try create; ignore if already exists
-            gh api --silent \
-              --method POST \
-              -H "Accept: application/vnd.github+json" \
-              /repos/${{ github.repository }}/labels \
-              -f name="$lbl" \
-              -f color="BFD4F2" \
-              -f description="Auto-created by AI triage" \
-            || true
-          done < "$RUNNER_TEMP/final_labels.txt"
-
-      - name: Apply labels to issue
-        if: ${{ steps.labels.outputs.labels != '' }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # Append (do not replace) labels
-          mapfile -t ADD_LABELS < "$RUNNER_TEMP/final_labels.txt"
-          for l in "${ADD_LABELS[@]}"; do
-            gh issue edit ${{ steps.ctx.outputs.issue }} --add-label "$l"
-          done
-
-      - name: Assign users (if proposed)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          ASSIGNEES=$(jq -r '.assignees[]?' "$RUNNER_TEMP/triage.json" | tr '\n' ' ')
-          if [ -n "$ASSIGNEES" ]; then
-            echo "Assigning: $ASSIGNEES"
-            gh issue edit ${{ steps.ctx.outputs.issue }} --add-assignee $ASSIGNEES || true
-          else
-            echo "No assignees proposed."
-          fi
-
-      - name: Close as duplicate (if confident and allowed)
-        if: ${{ env.ALLOW_AUTO_CLOSE_DUPLICATES == 'true' }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          IS_DUP=$(jq -r '.duplicate.is_duplicate' "$RUNNER_TEMP/triage.json")
-          CONF=$(jq -r '.duplicate.confidence // 0' "$RUNNER_TEMP/triage.json")
-          OF=$(jq -r '.duplicate.of_issue_number // 0' "$RUNNER_TEMP/triage.json")
-
-          if [ "$IS_DUP" = "true" ] && awk "BEGIN{exit !($CONF >= 0.7)}"; then
-            echo "Duplicate detected with confidence ${CONF} of #${OF}"
-            gh issue edit ${{ steps.ctx.outputs.issue }} --add-label "${DUPLICATE_LABEL}" || true
-            gh issue comment ${{ steps.ctx.outputs.issue }} --body "Closing as duplicate of #${OF} (AI confidence ${CONF}). If this is not correct, please comment and we will reopen."
-            # GitHub API supports state_reason only for 'completed'/'not_planned'; use label to mark duplicate.
-            gh issue close ${{ steps.ctx.outputs.issue }} --reason "not_planned"
-            echo "duplicate_closed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "duplicate_closed=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Post needs-more-info request (if needed and not closed)
-        if: ${{ steps.ai.outcome == 'success' && steps.triage.outputs.duplicate_closed != 'true' }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          NEEDS_INFO=$(jq -r '.needs_info' "$RUNNER_TEMP/triage.json")
-          if [ "$NEEDS_INFO" = "true" ]; then
-            MISSING=$(jq -r '.missing_info[]?' "$RUNNER_TEMP/triage.json" | sed 's/^/- /')
-            cat > "$RUNNER_TEMP/needs_info.md" <<'MD'
-Thanks for the report! To help us triage and reproduce, please provide the following:
-
-MD
-            if [ -n "$MISSING" ]; then
-              echo "$MISSING" >> "$RUNNER_TEMP/needs_info.md"
-              echo "" >> "$RUNNER_TEMP/needs_info.md"
-            fi
-            cat >> "$RUNNER_TEMP/needs_info.md" <<'MD'
-**Template**
-
-- Steps to reproduce:
-- Expected behavior:
-- Actual behavior:
-- Logs / stacktrace:
-- Environment (OS, runtime, versions):
-- Screenshots / recording (if applicable):
-
-Once updated, comment here and the bot will re-triage automatically. Thank you!
-MD
-            gh issue comment ${{ steps.ctx.outputs.issue }} --body-file "$RUNNER_TEMP/needs_info.md"
-          else
-            echo "No additional info requested."
-          fi
-
-      - name: Post triage summary comment (if not closed)
-        if: ${{ steps.triage.outputs.duplicate_closed != 'true' }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          CAT=$(jq -r '.category' "$RUNNER_TEMP/triage.json")
-          SEV=$(jq -r '.severity // "n/a"' "$RUNNER_TEMP/triage.json")
-          PRI=$(jq -r '.priority // "n/a"' "$RUNNER_TEMP/triage.json")
-          RATIONALE=$(jq -r '.rationale' "$RUNNER_TEMP/triage.json")
-          LABELS=$(cat "$RUNNER_TEMP/final_labels.txt" 2>/dev/null | sed 's/^/- `&`/' || true)
-          ASSIGNEES=$(jq -r '.assignees[]?' "$RUNNER_TEMP/triage.json" | sed 's/^/- @&/')
-          DUP=$(jq -r '.duplicate.is_duplicate' "$RUNNER_TEMP/triage.json")
-          DUP_OF=$(jq -r '.duplicate.of_issue_number // 0' "$RUNNER_TEMP/triage.json")
-          DUP_CONF=$(jq -r '.duplicate.confidence // 0' "$RUNNER_TEMP/triage.json")
-
+          cat > prompt.json <<'JSON'
           {
-            echo "### 🤖 AI Issue Triage Summary"
-            echo ""
-            echo "- **Category:** \`$CAT\`"
-            echo "- **Severity:** \`$SEV\`"
-            echo "- **Priority:** \`$PRI\`"
-            echo ""
-            [ -n "$LABELS" ] && echo "**Labels Applied**:" && echo "$LABELS" && echo ""
-            [ -n "$ASSIGNEES" ] && echo "**Suggested Assignees**:" && echo "$ASSIGNEES" && echo ""
-            if [ "$DUP" = "true" ]; then
-              echo "> Possible duplicate of #$DUP_OF (confidence $DUP_CONF)."
-              echo ""
-            fi
-            echo "**Rationale**"
-            echo ""
-            echo "$RATIONALE"
-            echo ""
-            echo "_This is an automated triage using GitHub Models (${MODEL_ID})._"
-          } > "$RUNNER_TEMP/triage_comment.md"
-
-          gh issue comment ${{ steps.ctx.outputs.issue }} --body-file "$RUNNER_TEMP/triage_comment.md"
-
-      - name: Re-triage trigger on comment (optional cleanup)
-        if: ${{ github.event_name == 'issue_comment' }}
-        run: |
-          echo "Comment received; triage executed. If you want different behavior (e.g., only when needs-more-info present), add a condition here."
+            "task": "Classify this issue with category, severity, and priority. Return strict JSON with keys: category, severity, priority, labels (array).",
+            "valid_values": {
+              "category": ["bug","feature","docs","question","chore","security","performance","other"],
+              "severity": ["critical","high","medium","low", "null"],
+              "priority": ["P0","P1","P2","P3", "null"]
+            },
+            "issue": {
+              "title": "${{ github.event.issue.title }}",
