@@ -6,12 +6,17 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
     branches: [ "main" ]
   workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to analyze"
+        required: true
+        type: string
 
 permissions:
-  contents: read           # to checkout code
-  pull-requests: write     # to post a PR comment
-  issues: write            # optional (not required unless you later open issues)
-  models: read             # required to call GitHub Models
+  contents: read
+  pull-requests: write
+  issues: write
+  models: read
 
 jobs:
   ai-security:
@@ -23,6 +28,7 @@ jobs:
           echo "Event: ${{ github.event_name }}"
           echo "Ref:   ${{ github.ref }}"
           echo "SHA:   ${{ github.sha }}"
+          echo "Input PR: ${{ inputs.pr_number }}"
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -30,17 +36,24 @@ jobs:
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      # Capture only on PR events
+      # Determine the PR number for both event types
+      - name: Resolve PR number
+        id: pr
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "number=${{ inputs.pr_number }}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Capture PR diff
-        if: ${{ github.event_name == 'pull_request' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh pr diff ${{ github.event.pull_request.number }} \
+          gh pr diff ${{ steps.pr.outputs.number }} \
             --repo "${{ github.repository }}" \
             > "$RUNNER_TEMP/pr.diff"
 
-      # (Optional) Provide a tiny bit of repo context to the model
       - name: Collect brief repo context
         run: |
           {
@@ -54,7 +67,6 @@ jobs:
           } > "$RUNNER_TEMP/repo_context.txt"
 
       - name: AI security review via GitHub Models
-        if: ${{ github.event_name == 'pull_request' }}
         id: ai
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -106,12 +118,11 @@ EOF
           fi
 
       - name: Comment on PR with AI security review
-        if: ${{ github.event_name == 'pull_request' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           BODY_FILE="$RUNNER_TEMP/ai_security_review.md"
           printf "%s\n" "${{ steps.ai.outputs.completion }}" > "$BODY_FILE"
-          gh pr comment ${{ github.event.pull_request.number }} \
+          gh pr comment ${{ steps.pr.outputs.number }} \
             --repo "${{ github.repository }}" \
             --body-file "$BODY_FILE"
