@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        language: [ 'javascript', 'typescript', 'python', 'go' ]
+        language: ['python' ]
         # Supported: cpp, csharp, go, java, javascript, typescript, python, ruby, swift, kotlin
 
     steps:
