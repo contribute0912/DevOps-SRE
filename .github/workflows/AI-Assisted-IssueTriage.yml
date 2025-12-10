@@ -1,116 +1,146 @@
 
-name: Simple AI Issue Triage
+name: AI Issue Triage (GitHub Models) — Improved
 
 on:
   issues:
-    types: [opened, edited, reopened]
+    types: [opened, edited, reopened, labeled, unlabeled]
   issue_comment:
     types: [created]
   workflow_dispatch:
     inputs:
       issue_number:
-        description: "Issue number to triage (required for manual run if no issue event)"
+        description: "Issue number to triage (optional; defaults to event issue)"
         required: false
         type: string
 
 permissions:
   contents: read
   issues: write
+  pull-requests: read
+  models: read
 
 env:
+  # ======= Customize these to your team/repo conventions =======
   MODEL_ID: "openai/gpt-4.1-mini"
 
-  # --- Label maps (edit to match your repo conventions) ---
-  SEVERITY_LABELS_JSON: |
-    { "critical": "severity:critical", "high": "severity:high", "medium": "severity:medium", "low": "severity:low" }
-  PRIORITY_LABELS_JSON: |
-    { "P0": "priority:P0", "P1": "priority:P1", "P2": "priority:P2", "P3": "priority:P3" }
-  TEAM_LABELS_JSON: |
-    { "frontend": "team:frontend", "backend": "team:backend", "platform": "team:platform", "infra": "team:infra", "security": "team:security", "docs": "team:docs" }
-
-  # --- Repo-specific label hints (keywords -> labels) ---
+  # Map of "keyword or area" -> labels to add. AI will use this context; we also apply AI-proposed labels.
   LABEL_HINTS_JSON: |
     {
       "bug": ["bug"],
-      "regression": ["regression","bug"],
-      "security": ["security","vulnerability"],
+      "regression": ["regression", "bug"],
+      "security": ["security", "vulnerability"],
       "perf": ["performance"],
       "docs": ["documentation"],
-      "ux": ["ux","ui"],
+      "ux": ["ux", "ui"],
+      "frontend": ["area:frontend", "ui"],
+      "backend": ["area:backend", "api"],
       "api": ["area:api"],
-      "ui": ["area:frontend","ui"],
-      "db": ["area:backend","database"],
       "infra": ["area:infra"],
       "test": ["area:test"],
-      "monitoring": ["observability","monitoring"],
-      "otel": ["opentelemetry","observability"]
+      "monitoring": ["observability", "monitoring"],
+      "otel": ["opentelemetry", "observability"]
     }
 
-  # --- Team ownership (components -> team + common keywords) ---
+  # Convert AI priority to labels you use
+  PRIORITY_LABELS_JSON: |
+    {
+      "P0": "priority:P0",
+      "P1": "priority:P1",
+      "P2": "priority:P2",
+      "P3": "priority:P3"
+    }
+
+  # Convert AI severity to labels you use
+  SEVERITY_LABELS_JSON: |
+    {
+      "critical": "severity:critical",
+      "high": "severity:high",
+      "medium": "severity:medium",
+      "low": "severity:low"
+    }
+
+  # Map AI team -> your team labels
+  TEAM_LABELS_JSON: |
+    {
+      "frontend": "team:frontend",
+      "backend": "team:backend",
+      "platform": "team:platform",
+      "infra": "team:infra",
+      "security": "team:security",
+      "docs": "team:docs"
+    }
+
+  # Team ownership (components -> team + common keywords)
   TEAM_OWNERSHIP_JSON: |
     {
-      "frontend": { "team": "frontend", "keywords": ["ui","ux","react","css","component"] },
-      "backend":  { "team": "backend",  "keywords": ["api","endpoint","service","java","python"] },
-      "platform": { "team": "platform", "keywords": ["k8s","aks","helm","pipeline","ci","cd"] },
-      "infra":    { "team": "infra",    "keywords": ["dns","network","load balancer","nginx","apache","tls"] },
-      "security": { "team": "security", "keywords": ["vulnerability","xss","csrf","secret","token"] },
+      "frontend": { "team": "frontend", "keywords": ["ui","ux","react","css","component","button","modal"] },
+      "backend":  { "team": "backend",  "keywords": ["api","endpoint","service","java","python","database","sql"] },
+      "platform": { "team": "platform", "keywords": ["k8s","aks","helm","pipeline","ci","cd","cluster"] },
+      "infra":    { "team": "infra",    "keywords": ["dns","network","load balancer","nginx","apache","tls","ssl","cert"] },
+      "security": { "team": "security", "keywords": ["vulnerability","xss","csrf","secret","token","leak","breach"] },
       "docs":     { "team": "docs",     "keywords": ["docs","documentation","readme","guide"] }
     }
 
-  # --- Priority-based responses (tune to your SLA) ---
-  PRIORITY_RESPONSE_TEMPLATES_JSON: |
-    {
-      "P0": "Marked as P0. The on-call is investigating immediately; update within 2 hours.",
-      "P1": "Marked as P1. We'll share a triage plan within 1 business day.",
-      "P2": "Marked as P2. We’ll review in the next sprint planning.",
-      "P3": "Marked as P3. Added to backlog; we'll revisit when capacity allows."
-    }
+  NEEDS_INFO_LABEL: "needs-more-info"
+  DUPLICATE_LABEL: "duplicate"
+  # When true, the workflow will close issues the model flags as a confident duplicate.
+  ALLOW_AUTO_CLOSE_DUPLICATES: "false" # simplified: duplicates disabled in this version
 
 jobs:
   triage:
     runs-on: ubuntu-latest
 
     steps:
-      # --- Resolve issue number for all trigger types ---
+      - name: Sanity step (runs on all events)
+        run: |
+          echo "Event: ${{ github.event_name }}"
+          echo "Ref: ${{ github.ref }}"
+          echo "SHA: ${{ github.sha }}"
+
+      - name: Install jq
+        run: |
+          sudo apt-get update && sudo apt-get install -y jq
+
       - name: Resolve issue number
         id: ctx
         run: |
-          ISSUE_NUM=""
-          EVENT_NAME="${{ github.event_name }}"
-          if [ "$EVENT_NAME" = "issues" ] || [ "$EVENT_NAME" = "issue_comment" ]; then
-            ISSUE_NUM="${{ github.event.issue.number }}"
-          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+          # Determine the target issue number from event or workflow input
+          if [ -n "${{ github.event.inputs.issue_number }}" ]; then
             ISSUE_NUM="${{ github.event.inputs.issue_number }}"
-          fi
-
-          if [ -z "$ISSUE_NUM" ]; then
-            echo "::error::Issue number is empty. Provide 'issue_number' when manually dispatching, or run on an issue/issue_comment event."
+          elif [ "${{ github.event_name }}" = "issues" ] || [ "${{ github.event_name }}" = "issue_comment" ]; then
+            ISSUE_NUM="${{ github.event.issue.number }}"
+          else
+            echo "::error::No issue number available for this event; supply workflow_dispatch input 'issue_number'."
             exit 1
           fi
+          echo "issue=${ISSUE_NUM}" >> "$GITHUB_OUTPUT"
+          echo "Resolved issue: ${ISSUE_NUM}"
 
-          echo "issue=$ISSUE_NUM" >> "$GITHUB_OUTPUT"
-          echo "Resolved issue number: $ISSUE_NUM"
-
-      - name: Install jq and gh
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y jq
-          gh --version || (type -p curl >/dev/null || sudo apt-get install -y curl && \
-            curl -fsSL https://raw.githubusercontent.com/cli/cli/trunk/script/install.sh | sudo bash)
-
-      # --- Call GitHub Models with enriched context (label hints & team owners) ---
-      - name: Call GitHub Model
+      - name: Fetch issue JSON
+        id: fetch
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api \
+            --repo "${{ github.repository }}" \
+            repos/${{ github.repository }}/issues/${{ steps.ctx.outputs.issue }} \
+            --jq '.' > "$RUNNER_TEMP/issue.json"
+          jq '{number, title, user: .user.login, body, state, labels: [.labels[].name], created_at, updated_at}' "$RUNNER_TEMP/issue.json" > "$RUNNER_TEMP/issue_min.json"
+          echo "Fetched issue:"
+          cat "$RUNNER_TEMP/issue_min.json"
+
+      # === Build stronger AI prompt + few-shot examples ===
+      - name: Build AI prompt
+        id: prompt
+        env:
           LABEL_HINTS_JSON: ${{ env.LABEL_HINTS_JSON }}
           TEAM_OWNERSHIP_JSON: ${{ env.TEAM_OWNERSHIP_JSON }}
         run: |
-          # Build the "user" JSON with jq so env JSON is injected safely
-          USER=$(jq -n \
-            --arg title "${{ github.event.issue.title }}" \
-            --arg body "${{ github.event.issue.body }}" \
-            --argjson hints "${LABEL_HINTS_JSON}" \
-            --argjson owners "${TEAM_OWNERSHIP_JSON}" \
+          ISSUE_JSON=$(cat "$RUNNER_TEMP/issue_min.json")
+          USER_TEXT=$(jq -n \
+            --argjson issue "$ISSUE_JSON" \
+            --argjson hints "$LABEL_HINTS_JSON" \
+            --argjson owners "$TEAM_OWNERSHIP_JSON" \
             '{
               task: "Perform issue triage. Return STRICT JSON only.",
               schema: {
@@ -125,23 +155,53 @@ jobs:
               },
               rules: [
                 "Use LABEL_HINTS and TEAM_OWNERSHIP to propose relevant labels and team.",
-                "If impact is clearly severe (outage, data loss, security exploit) set severity=critical/high and priority=P0/P1.",
+                "If text implies outage/data loss/security exploit, set severity=critical/high and priority=P0/P1.",
+                "If performance regression is clear, set severity=medium/high and priority=P1/P2.",
                 "If unclear, set severity and priority to null.",
                 "Return max 5 labels; avoid duplicates.",
-                "If details are missing to reproduce or assess impact, set needs_info=true and populate missing_info."
+                "If reproduction/impact details missing, set needs_info=true and populate missing_info."
               ],
-              issue: { title: $title, body: $body },
+              issue: $issue,
               label_hints: $hints,
               team_ownership: $owners
             }')
-
           SYS_PROMPT='You are an expert triage engineer. Output STRICT JSON only with keys: category,severity,priority,team,labels,needs_info,missing_info,rationale.'
+          FEWSHOT_1='{"category":"bug","severity":"high","priority":"P1","team":"frontend","labels":["bug","area:frontend","ui"],"needs_info":false,"missing_info":[],"rationale":"UI action triggers 500 error; clear frontend bug"}'
+          FEWSHOT_2='{"category":"performance","severity":"medium","priority":"P2","team":"backend","labels":["performance","area:backend","api"],"needs_info":true,"missing_info":["logs","environment","version"],"rationale":"API latency regression; missing diagnostics"}'
+          printf "%s" "$SYS_PROMPT" > "$RUNNER_TEMP/sys_prompt.txt"
+          printf "%s" "$USER_TEXT" > "$RUNNER_TEMP/user_prompt.json"
+          echo "system<<SYS_EOF" >> "$GITHUB_OUTPUT"
+          cat "$RUNNER_TEMP/sys_prompt.txt" >> "$GITHUB_OUTPUT"
+          echo "SYS_EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Call GitHub Models for triage (curl)
+        id: ai
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          USER=$(cat "$RUNNER_TEMP/user_prompt.json")
+          SYS=$(cat "$RUNNER_TEMP/sys_prompt.txt")
+          FEWSHOT_1='{"category":"bug","severity":"high","priority":"P1","team":"frontend","labels":["bug","area:frontend","ui"],"needs_info":false,"missing_info":[],"rationale":"UI action triggers 500 error; clear frontend bug"}'
+          FEWSHOT_2='{"category":"performance","severity":"medium","priority":"P2","team":"backend","labels":["performance","area:backend","api"],"needs_info":true,"missing_info":["logs","environment","version"],"rationale":"API latency regression; missing diagnostics"}'
 
           PAYLOAD=$(jq -n \
-            --arg model "$MODEL_ID" \
-            --arg sys "$SYS_PROMPT" \
+            --arg model "${MODEL_ID}" \
+            --arg sys "$SYS" \
+            --arg ex1 "$FEWSHOT_1" \
+            --arg ex2 "$FEWSHOT_2" \
             --arg user "$USER" \
-            '{model:$model, messages:[{"role":"system","content":$sys},{"role":"user","content":$user}], temperature:0.2}')
+            '{
+              model: $model,
+              messages: [
+                {"role":"system","content":$sys},
+                {"role":"user","content":"Example 1:"},
+                {"role":"assistant","content":$ex1},
+                {"role":"user","content":"Example 2:"},
+                {"role":"assistant","content":$ex2},
+                {"role":"user","content":$user}
+              ],
+              temperature: 0.2
+            }')
 
           RESPONSE=$(curl -sS -X POST \
             -H "Accept: application/vnd.github+json" \
@@ -152,118 +212,210 @@ jobs:
             -d "$PAYLOAD")
 
           CONTENT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty')
-          [ -z "$CONTENT" ] && CONTENT='{"category":"other","severity":"null","priority":"null","team":"null","labels":[],"needs_info":false,"missing_info":[],"rationale":"fallback"}'
-          printf "%s" "$CONTENT" > triage_raw.txt
-          # Extract strict JSON if prose surrounds it
-          sed -n '1h;1!H;${;g;s/^[^{]*{/{/;s/}[^}]*$/}/;p;}' triage_raw.txt > triage_maybe.json || true
-          if jq -e . triage_maybe.json >/dev/null 2>&1; then
-            jq '.' triage_maybe.json > triage.json
+          if [ -z "$CONTENT" ]; then
+            echo "Model returned no content; dumping response:"
+            echo "$RESPONSE"
+            echo "{}" > "$RUNNER_TEMP/triage_raw.txt"
           else
-            echo '{"category":"other","severity":"null","priority":"null","team":"null","labels":[],"needs_info":false,"missing_info":[],"rationale":"fallback"}' > triage.json
+            printf "%s" "$CONTENT" > "$RUNNER_TEMP/triage_raw.txt"
           fi
 
-      # --- Compute final labels (AI + mappings) ---
-      - name: Compute labels
+          # Try to salvage JSON even if model wrapped it in prose or fences
+          sed -n '1h;1!H;${;g;s/^[^{]*{/{/;s/}[^}]*$/}/;p;}' "$RUNNER_TEMP/triage_raw.txt" > "$RUNNER_TEMP/triage_maybe.json" || true
+          if jq -e . "$RUNNER_TEMP/triage_maybe.json" > /dev/null 2>&1; then
+            jq '.' "$RUNNER_TEMP/triage_maybe.json" > "$RUNNER_TEMP/triage.json"
+          else
+            echo "::warning::AI output was not valid JSON. Falling back to minimal triage."
+            echo '{"category":"other","severity":null,"priority":null,"team":null,"labels":[],"needs_info":false,"missing_info":[],"rationale":"fallback"}' > "$RUNNER_TEMP/triage.json"
+          fi
+          echo "triage<<JSON_EOF" >> "$GITHUB_OUTPUT"
+          cat "$RUNNER_TEMP/triage.json" >> "$GITHUB_OUTPUT"
+          echo "JSON_EOF" >> "$GITHUB_OUTPUT"
+
+      # === Heuristic fallback if AI returns null severity & priority ===
+      - name: Heuristic fallback (if severity/priority are null)
+        run: |
+          TITLE=$(jq -r '.title // ""' "$RUNNER_TEMP/issue_min.json")
+          BODY=$(jq -r '.body // ""' "$RUNNER_TEMP/issue_min.json")
+          LOWER=$(printf "%s\n%s" "$TITLE" "$BODY" | tr '[:upper:]' '[:lower:]')
+          SEV=$(jq -r '.severity // "null"' "$RUNNER_TEMP/triage.json")
+          PRI=$(jq -r '.priority // "null"' "$RUNNER_TEMP/triage.json")
+          CAT=$(jq -r '.category // "other"' "$RUNNER_TEMP/triage.json")
+          TEAM=$(jq -r '.team // "null"' "$RUNNER_TEMP/triage.json")
+
+          if [ "$SEV" = "null" ] && [ "$PRI" = "null" ]; then
+            if echo "$LOWER" | grep -Eq 'security|vulnerability|xss|csrf|secret|token|leak|breach|exploit|outage|downtime|data loss'; then
+              SEV="high"; PRI="P1"; [ "$CAT" = "other" ] && CAT="security"
+            elif echo "$LOWER" | grep -Eq 'perf|performance|slow|latency|timeout|hang|sluggish'; then
+              SEV="medium"; PRI="P2"; [ "$CAT" = "other" ] && CAT="performance"
+            elif echo "$LOWER" | grep -Eq 'crash|error|exception|traceback|500|stack|fail|broken'; then
+              SEV="high"; PRI="P1"; [ "$CAT" = "other" ] && CAT="bug"
+            else
+              SEV="low"; PRI="P3"
+            fi
+
+            if [ "$TEAM" = "null" ]; then
+              if echo "$LOWER" | grep -Eq 'ui|ux|react|css|button|dropdown|modal|frontend'; then TEAM="frontend"; fi
+              if echo "$LOWER" | grep -Eq 'api|endpoint|service|backend|database|sql|java|python'; then TEAM="backend"; fi
+              if echo "$LOWER" | grep -Eq 'k8s|aks|helm|pipeline|ci|cd|cluster|node|pod'; then TEAM="platform"; fi
+              if echo "$LOWER" | grep -Eq 'dns|network|load balancer|nginx|apache|tls|ssl|cert'; then TEAM="infra"; fi
+              if echo "$LOWER" | grep -Eq 'security|vulnerability|token|xss|csrf|secret'; then TEAM="security"; fi
+              if echo "$LOWER" | grep -Eq 'docs|documentation|readme|guide'; then TEAM="docs"; fi
+            fi
+
+            jq --arg cat "$CAT" --arg sev "$SEV" --arg pri "$PRI" --arg team "$TEAM" \
+               '.category=$cat | .severity=$sev | .priority=$pri | .team=$team' \
+               "$RUNNER_TEMP/triage.json" > "$RUNNER_TEMP/triage.json.tmp" && mv "$RUNNER_TEMP/triage.json.tmp" "$RUNNER_TEMP/triage.json"
+          fi
+
+          echo "After heuristic -> category=$(jq -r '.category' "$RUNNER_TEMP/triage.json"), severity=$(jq -r '.severity' "$RUNNER_TEMP/triage.json"), priority=$(jq -r '.priority' "$RUNNER_TEMP/triage.json"), team=$(jq -r '.team' "$RUNNER_TEMP/triage.json")"
+
+      - name: Compute final label set (AI + mappings)
         id: labels
         env:
           SEVERITY_LABELS_JSON: ${{ env.SEVERITY_LABELS_JSON }}
           PRIORITY_LABELS_JSON: ${{ env.PRIORITY_LABELS_JSON }}
           TEAM_LABELS_JSON: ${{ env.TEAM_LABELS_JSON }}
+          NEEDS_INFO_LABEL: ${{ env.NEEDS_INFO_LABEL }}
         run: |
-          CATEGORY=$(jq -r '.category // empty' triage.json)
-          SEV_KEY=$(jq -r '.severity // empty' triage.json)
-          PRI_KEY=$(jq -r '.priority // empty' triage.json)
-          TEAM_KEY=$(jq -r '.team // empty' triage.json)
+          TRIAGE="$RUNNER_TEMP/triage.json"
+          # Start with AI-proposed labels
+          jq -r '.labels[]? // empty' "$TRIAGE" > "$RUNNER_TEMP/final_labels.txt" || true
 
-          jq -r '.labels[]? // empty' triage.json > labels.tmp || true
-          [ -n "$CATEGORY" ] && [ "$CATEGORY" != "null" ] && echo "$CATEGORY" >> labels.tmp
+          # Add category label optionally
+          CAT=$(jq -r '.category // empty' "$TRIAGE")
+          [ -n "$CAT" ] && [ "$CAT" != "null" ] && echo "$CAT" >> "$RUNNER_TEMP/final_labels.txt"
 
-          SEV_LABEL=$(jq -r --arg k "$SEV_KEY" '.[$k] // empty' <<< "$SEVERITY_LABELS_JSON")
-          PRI_LABEL=$(jq -r --arg k "$PRI_KEY" '.[$k] // empty' <<< "$PRIORITY_LABELS_JSON")
-          TEAM_LABEL=$(jq -r --arg k "$TEAM_KEY" '.[$k] // empty' <<< "$TEAM_LABELS_JSON")
+          # Map severity/priority/team keys -> labels
+          SEV_KEY=$(jq -r '.severity // empty' "$TRIAGE")
+          PRIO_KEY=$(jq -r '.priority // empty' "$TRIAGE")
+          TEAM_KEY=$(jq -r '.team // empty' "$TRIAGE")
 
-          [ -n "$SEV_LABEL" ] && echo "$SEV_LABEL" >> labels.tmp
-          [ -n "$PRI_LABEL" ] && echo "$PRI_LABEL" >> labels.tmp
-          [ -n "$TEAM_LABEL" ] && echo "$TEAM_LABEL" >> labels.tmp
+          SEV_LABEL=$(jq -r --arg k "$SEV_KEY" '.[$k] // empty' <<< "${SEVERITY_LABELS_JSON}")
+          PRIO_LABEL=$(jq -r --arg k "$PRIO_KEY" '.[$k] // empty' <<< "${PRIORITY_LABELS_JSON}")
+          TEAM_LABEL=$(jq -r --arg k "$TEAM_KEY" '.[$k] // empty' <<< "${TEAM_LABELS_JSON}")
 
-          (cat labels.tmp 2>/dev/null || true) | awk 'NF' | sort -u > final_labels.txt
+          [ -n "$SEV_LABEL" ] && echo "$SEV_LABEL" >> "$RUNNER_TEMP/final_labels.txt"
+          [ -n "$PRIO_LABEL" ] && echo "$PRIO_LABEL" >> "$RUNNER_TEMP/final_labels.txt"
+          [ -n "$TEAM_LABEL" ] && echo "$TEAM_LABEL" >> "$RUNNER_TEMP/final_labels.txt"
 
-          echo "labels<<EOF" >> "$GITHUB_OUTPUT"
-          cat final_labels.txt >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
-          echo "priority=$PRI_KEY" >> "$GITHUB_OUTPUT"
-          echo "team_key=$TEAM_KEY" >> "$GITHUB_OUTPUT"
-          echo "team_label=$TEAM_LABEL" >> "$GITHUB_OUTPUT"
+          # Add NEEDS_INFO_LABEL if needed
+          NEEDS_INFO=$(jq -r '.needs_info // false' "$TRIAGE")
+          if [ "$NEEDS_INFO" = "true" ]; then
+            echo "${NEEDS_INFO_LABEL}" >> "$RUNNER_TEMP/final_labels.txt"
+          fi
 
-      # --- Create labels if missing ---
-      - name: Ensure labels exist
+          # Deduplicate and filter empties
+          (cat "$RUNNER_TEMP/final_labels.txt" 2>/dev/null || true) | awk 'NF' | sort -u > "$RUNNER_TEMP/final_labels.txt.dedup"
+          mv "$RUNNER_TEMP/final_labels.txt.dedup" "$RUNNER_TEMP/final_labels.txt"
+
+          echo "labels<<LBL_EOF" >> "$GITHUB_OUTPUT"
+          cat "$RUNNER_TEMP/final_labels.txt" >> "$GITHUB_OUTPUT"
+          echo "LBL_EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure labels exist (create if missing)
         if: ${{ steps.labels.outputs.labels != '' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           while IFS= read -r lbl; do
             [ -z "$lbl" ] && continue
-            gh api --silent --method POST \
+            gh api --silent \
+              --method POST \
               -H "Accept: application/vnd.github+json" \
               /repos/${{ github.repository }}/labels \
               -f name="$lbl" \
               -f color="BFD4F2" \
-              -f description="Auto-created by triage workflow" || true
-          done < final_labels.txt
+              -f description="Auto-created by AI triage" || true
+          done < "$RUNNER_TEMP/final_labels.txt"
 
-      # --- Apply labels in one call (no checkout needed) ---
-      - name: Apply labels
+      - name: Apply labels to issue (single call)
         if: ${{ steps.labels.outputs.labels != '' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if [ ! -s final_labels.txt ]; then
+          ISSUE=${{ steps.ctx.outputs.issue }}
+          if [ ! -s "$RUNNER_TEMP/final_labels.txt" ]; then
             echo "No labels to apply."
             exit 0
           fi
-          ISSUE_NUM="${{ steps.ctx.outputs.issue }}"
-          LABELS=$(paste -sd, final_labels.txt)
-          echo "Applying labels: $LABELS to issue #$ISSUE_NUM in ${{ github.repository }}"
-          gh issue edit "$ISSUE_NUM" --add-label "$LABELS" --repo "${{ github.repository }}"
+          LABELS=$(paste -sd, "$RUNNER_TEMP/final_labels.txt")
+          echo "Applying labels: $LABELS to issue #$ISSUE"
+          gh issue edit "$ISSUE" --add-label "$LABELS" --repo "${{ github.repository }}"
 
-      # --- Rich summary with priority, team routing, and needs-info checklist ---
-      - name: Post triage summary
+      - name: Assign users (if proposed)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PRIORITY_RESPONSE_TEMPLATES_JSON: ${{ env.PRIORITY_RESPONSE_TEMPLATES_JSON }}
         run: |
-          ISSUE_NUM="${{ steps.ctx.outputs.issue }}"
-          PRI="${{ steps.labels.outputs.priority }}"
-          TEAM_LABEL="${{ steps.labels.outputs.team_label }}"
+          ASSIGNEES=$(jq -r '.assignees[]?' "$RUNNER_TEMP/triage.json" | tr '\n' ' ')
+          if [ -n "$ASSIGNEES" ]; then
+            echo "Assigning: $ASSIGNEES"
+            gh issue edit ${{ steps.ctx.outputs.issue }} --add-assignee $ASSIGNEES --repo "${{ github.repository }}" || true
+          else
+            echo "No assignees proposed."
+          fi
 
-          RESP=$(jq -r --arg k "$PRI" '.[$k] // empty' <<< "$PRIORITY_RESPONSE_TEMPLATES_JSON")
-          [ -z "$RESP" ] && RESP="Thanks! We’ve recorded this and will update with progress."
+      - name: Post needs-more-info request (if needed)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          NEEDS_INFO=$(jq -r '.needs_info // false' "$RUNNER_TEMP/triage.json")
+          if [ "$NEEDS_INFO" = "true" ]; then
+            MISSING=$(jq -r '.missing_info[]? // empty' "$RUNNER_TEMP/triage.json" | sed 's/^/- /')
+            {
+              echo "Thanks for the report! To help us triage and reproduce, please provide the following:"
+              [ -n "$MISSING" ] && echo "$MISSING" && echo ""
+              echo "**Template**"
+              echo "- Steps to reproduce:"
+              echo "- Expected behavior:"
+              echo "- Actual behavior:"
+              echo "- Logs / stacktrace:"
+              echo "- Environment (OS, runtime, versions):"
+              echo "- Screenshots / recording (if applicable):"
+              echo ""
+              echo "Once updated, comment here and the bot will re-triage automatically. Thank you!"
+            } > "$RUNNER_TEMP/needs_info.md"
+            gh issue comment ${{ steps.ctx.outputs.issue }} --body-file "$RUNNER_TEMP/needs_info.md" --repo "${{ github.repository }}"
+          else
+            echo "No additional info requested."
+          fi
 
-          CAT=$(jq -r '.category // "other"' triage.json)
-          SEV=$(jq -r '.severity // "n/a"' triage.json)
-          PRI_VAL=$(jq -r '.priority // "n/a"' triage.json)
-          TEAM=$(jq -r '.team // "n/a"' triage.json)
-          NEEDS_INFO=$(jq -r '.needs_info // false' triage.json)
-          MISSING=$(jq -r '.missing_info[]? // empty' triage.json | sed 's/^/- /')
+      - name: Post triage summary comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PRIORITY_LABELS_JSON: ${{ env.PRIORITY_LABELS_JSON }}
+        run: |
+          CAT=$(jq -r '.category' "$RUNNER_TEMP/triage.json")
+          SEV=$(jq -r '.severity // "n/a"' "$RUNNER_TEMP/triage.json")
+          PRI=$(jq -r '.priority // "n/a"' "$RUNNER_TEMP/triage.json")
+          TEAM=$(jq -r '.team // "n/a"' "$RUNNER_TEMP/triage.json")
+          RATIONALE=$(jq -r '.rationale' "$RUNNER_TEMP/triage.json")
+          LABELS=$(cat "$RUNNER_TEMP/final_labels.txt" 2>/dev/null | sed 's/^/- `&`/' || true)
+          NEEDS_INFO=$(jq -r '.needs_info // false' "$RUNNER_TEMP/triage.json")
+          MISSING=$(jq -r '.missing_info[]? // empty' "$RUNNER_TEMP/triage.json" | sed 's/^/- /')
 
           {
-            echo "### 🤖 Auto-triage summary"
+            echo "### 🤖 AI Issue Triage Summary"
+            echo ""
             echo "- **Category:** \`$CAT\`"
             echo "- **Severity:** \`$SEV\`"
-            echo "- **Priority:** \`$PRI_VAL\`"
+            echo "- **Priority:** \`$PRI\`"
             echo "- **Team:** \`$TEAM\`"
-            if [ -n "$TEAM_LABEL" ]; then
-              echo "- **Routing via label:** \`$TEAM_LABEL\`"
-            fi
-            echo
-            echo "$RESP"
+            [ -n "$LABELS" ] && echo "**Labels Applied**:" && echo "$LABELS" && echo ""
+            echo "**Rationale**"
+            echo ""
+            echo "$RATIONALE"
             if [ "$NEEDS_INFO" = "true" ]; then
-              echo
+              echo ""
               echo "**More information needed to proceed:**"
               [ -n "$MISSING" ] && echo "$MISSING"
             fi
-            echo
-            echo "_Posted by Simple AI Triage (Model: $MODEL_ID)._"
-          } > triage_comment.md
+            echo ""
+            echo "_This is an automated triage using GitHub Models (${MODEL_ID})._"
+          } > "$RUNNER_TEMP/triage_comment.md"
+          gh issue comment ${{ steps.ctx.outputs.issue }} --body-file "$RUNNER_TEMP/triage_comment.md" --repo "${{ github.repository }}"
 
-          gh issue comment "$ISSUE_NUM" --body-file triage_comment.md --repo "${{ github.repository }}"
+      - name: Re-triage trigger on comment (optional cleanup)
+        if: ${{ github.event_name == 'issue_comment' }}
+        run: |
+          echo "Comment received; triage executed."
